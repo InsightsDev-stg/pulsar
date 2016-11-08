@@ -58,7 +58,7 @@ public class Properties extends AdminResource {
 
         try {
             List<String> properties = globalZk().getChildren(path("policies"), false);
-            Collections.sort(properties);
+            properties.sort(null);
             return properties;
         } catch (Exception e) {
             log.error("[{}] Failed to get properties list", clientAppId(), e);
@@ -75,10 +75,8 @@ public class Properties extends AdminResource {
         validateSuperUserAccess();
 
         try {
-            return propertiesCache().get(path("policies", property));
-        } catch (KeeperException.NoNodeException e) {
-            log.warn("[{}] Failed to get property {}: Does not exist", clientAppId(), property);
-            throw new RestException(Status.NOT_FOUND, "Property does not exist");
+            return propertiesCache().get(path("policies", property))
+                    .orElseThrow(() -> new RestException(Status.NOT_FOUND, "Property does not exist"));
         } catch (Exception e) {
             log.error("[{}] Failed to get property {}", clientAppId(), property, e);
             throw new RestException(e);

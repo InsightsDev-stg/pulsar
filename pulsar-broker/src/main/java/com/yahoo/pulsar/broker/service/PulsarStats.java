@@ -18,6 +18,8 @@ package com.yahoo.pulsar.broker.service;
 import java.io.Closeable;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Consumer;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -25,13 +27,13 @@ import org.slf4j.LoggerFactory;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.yahoo.pulsar.broker.PulsarService;
-import com.yahoo.pulsar.broker.loadbalance.data.NamespaceBundleStats;
 import com.yahoo.pulsar.broker.service.persistent.PersistentTopic;
 import com.yahoo.pulsar.broker.stats.BrokerOperabilityMetrics;
 import com.yahoo.pulsar.broker.stats.ClusterReplicationMetrics;
 import com.yahoo.pulsar.broker.stats.Metrics;
 import com.yahoo.pulsar.broker.stats.NamespaceStats;
 import com.yahoo.pulsar.common.naming.NamespaceBundle;
+import com.yahoo.pulsar.common.policies.data.loadbalancer.NamespaceBundleStats;
 import com.yahoo.pulsar.common.util.collections.ConcurrentOpenHashMap;
 import com.yahoo.pulsar.utils.StatsOutputStream;
 
@@ -51,6 +53,8 @@ public class PulsarStats implements Closeable {
     private List<Metrics> metricsCollection;
     private final BrokerOperabilityMetrics brokerOperabilityMetrics;
 
+    private final ReentrantReadWriteLock bufferLock = new ReentrantReadWriteLock();
+
     public PulsarStats(PulsarService pulsar) {
         this.topicStatsBuf = PooledByteBufAllocator.DEFAULT.heapBuffer(16 * 1024);
         this.tempTopicStatsBuf = PooledByteBufAllocator.DEFAULT.heapBuffer(16 * 1024);
@@ -62,7 +66,7 @@ public class PulsarStats implements Closeable {
         this.tempMetricsCollection = Lists.newArrayList();
         this.metricsCollection = Lists.newArrayList();
         this.brokerOperabilityMetrics = new BrokerOperabilityMetrics(pulsar.getConfiguration().getClusterName(),
-                pulsar.getHost());
+                pulsar.getAdvertisedAddress());
     }
 
     @Override
@@ -148,21 +152,23 @@ public class PulsarStats implements Closeable {
         metricsCollection = tempMetricsCollection;
         tempMetricsCollection = tempRefMetrics;
 
-        ByteBuf tmp = topicStatsBuf;
-        topicStatsBuf = tempTopicStatsBuf;
-        tempTopicStatsBuf = tmp;
+        bufferLock.writeLock().lock();
+        try {
+            ByteBuf tmp = topicStatsBuf;
+            topicStatsBuf = tempTopicStatsBuf;
+            tempTopicStatsBuf = tmp;
+            tempTopicStatsBuf.clear();
+        } finally {
+            bufferLock.writeLock().unlock();
+        }
     }
 
-    public ByteBuf getDimensionMetrics() {
-        while (true) {
-            ByteBuf topicStatsBuf = this.topicStatsBuf;
-            try {
-                topicStatsBuf.retain();
-                return topicStatsBuf;
-            } catch (Exception e) {
-                // Re-fetch the buffer, since it have been swapped and release
-                continue;
-            }
+    public void getDimensionMetrics(Consumer<ByteBuf> consumer) {
+        bufferLock.readLock().lock();
+        try {
+            consumer.accept(topicStatsBuf);
+        } finally {
+            bufferLock.readLock().unlock();
         }
     }
 

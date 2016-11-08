@@ -26,11 +26,17 @@ public class ConsumerStats {
     /** Total throughput delivered to the consumer. bytes/s */
     public double msgThroughputOut;
 
+    /** Total rate of messages redelivered by this consumer. msg/s */
+    public double msgRateRedeliver;
+
     /** Name of the consumer */
     public String consumerName;
 
     /** Number of available message permits for the consumer */
     public int availablePermits;
+    
+    /** Number of unacknowledged messages for the consumer */
+    public int unackedMessages;
 
     /** Address of this consumer */
     public String address;
@@ -42,7 +48,9 @@ public class ConsumerStats {
         checkNotNull(stats);
         this.msgRateOut += stats.msgRateOut;
         this.msgThroughputOut += stats.msgThroughputOut;
+        this.msgRateRedeliver += stats.msgRateRedeliver;
         this.availablePermits += stats.availablePermits;
+        this.unackedMessages += stats.unackedMessages;
         return this;
     }
 }

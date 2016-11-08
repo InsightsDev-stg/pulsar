@@ -63,7 +63,7 @@ public class SimpleProducerConsumerStatTest extends ProducerConsumerBase {
 
     @DataProvider(name = "batch_with_timeout")
     public Object[][] ackTimeoutSecProvider() {
-        return new Object[][] { { 0, 0 }, { 0, 1 }, { 1000, 0 }, { 1000, 1 } };
+        return new Object[][] { { 0, 0 }, { 0, 2 }, { 1000, 0 }, { 1000, 2 } };
     }
 
     @Test(dataProvider = "batch_with_timeout")
@@ -71,6 +71,8 @@ public class SimpleProducerConsumerStatTest extends ProducerConsumerBase {
         log.info("-- Starting {} test --", methodName);
         ConsumerConfiguration conf = new ConsumerConfiguration();
         conf.setSubscriptionType(SubscriptionType.Exclusive);
+        // Cumulative Ack-counter works if ackTimeOutTimer-task is enabled
+        boolean isAckTimeoutTaskEnabledForCumulativeAck = ackTimeoutSec > 0;
         if (ackTimeoutSec > 0) {
             conf.setAckTimeout(ackTimeoutSec, TimeUnit.SECONDS);
         }
@@ -107,7 +109,7 @@ public class SimpleProducerConsumerStatTest extends ProducerConsumerBase {
         Thread.sleep(2000);
         consumer.close();
         producer.close();
-        validatingLogInfo(consumer, producer);
+        validatingLogInfo(consumer, producer, isAckTimeoutTaskEnabledForCumulativeAck);
         log.info("-- Exiting {} test --", methodName);
     }
 
@@ -133,7 +135,7 @@ public class SimpleProducerConsumerStatTest extends ProducerConsumerBase {
         Producer producer = pulsarClient.createProducer("persistent://my-property/tp1/my-ns/my-topic2", producerConf);
         List<Future<MessageId>> futures = Lists.newArrayList();
 
-        int numMessages = 5001;
+        int numMessages = 50;
         // Asynchronously produce messages
         for (int i = 0; i < numMessages; i++) {
             final String message = "my-message-" + i;
@@ -151,9 +153,6 @@ public class SimpleProducerConsumerStatTest extends ProducerConsumerBase {
         for (int i = 0; i < numMessages; i++) {
             msg = consumer.receive(5, TimeUnit.SECONDS);
             String receivedMessage = new String(msg.getData());
-            if (i % 1000 == 0) {
-                log.info("Received message: [{}]", receivedMessage);
-            }
             String expectedMessage = "my-message-" + i;
             testMessageOrderAndDuplicates(messageSet, receivedMessage, expectedMessage);
         }
@@ -165,7 +164,7 @@ public class SimpleProducerConsumerStatTest extends ProducerConsumerBase {
         Thread.sleep(2000);
         consumer.close();
         producer.close();
-        validatingLogInfo(consumer, producer);
+        validatingLogInfo(consumer, producer, batchMessageDelayMs == 0 && ackTimeoutSec > 0);
         log.info("-- Exiting {} test --", methodName);
     }
 
@@ -224,7 +223,7 @@ public class SimpleProducerConsumerStatTest extends ProducerConsumerBase {
         Thread.sleep(5000);
         consumer.close();
         producer.close();
-        validatingLogInfo(consumer, producer);
+        validatingLogInfo(consumer, producer, batchMessageDelayMs == 0 && ackTimeoutSec > 0);
         log.info("-- Exiting {} test --", methodName);
     }
 
@@ -232,6 +231,7 @@ public class SimpleProducerConsumerStatTest extends ProducerConsumerBase {
     public void testMessageListener(int batchMessageDelayMs) throws Exception {
         log.info("-- Starting {} test --", methodName);
         ConsumerConfiguration conf = new ConsumerConfiguration();
+        conf.setAckTimeout(100, TimeUnit.SECONDS);
         conf.setSubscriptionType(SubscriptionType.Exclusive);
 
         int numMessages = 100;
@@ -272,7 +272,7 @@ public class SimpleProducerConsumerStatTest extends ProducerConsumerBase {
         assertEquals(latch.await(numMessages, TimeUnit.SECONDS), true, "Timed out waiting for message listener acks");
         consumer.close();
         producer.close();
-        validatingLogInfo(consumer, producer);
+        validatingLogInfo(consumer, producer, true);
         log.info("-- Exiting {} test --", methodName);
     }
 
@@ -324,7 +324,8 @@ public class SimpleProducerConsumerStatTest extends ProducerConsumerBase {
         log.info("-- Exiting {} test --", methodName);
     }
 
-    public void validatingLogInfo(Consumer consumer, Producer producer) throws InterruptedException {
+    public void validatingLogInfo(Consumer consumer, Producer producer, boolean verifyAckCount)
+            throws InterruptedException {
         // Waiting for recording last stat info
         Thread.sleep(1000);
         ConsumerStats cStat = consumer.getStats();
@@ -332,7 +333,9 @@ public class SimpleProducerConsumerStatTest extends ProducerConsumerBase {
         assertEquals(pStat.getTotalMsgsSent(), cStat.getTotalMsgsReceived());
         assertEquals(pStat.getTotalBytesSent(), cStat.getTotalBytesReceived());
         assertEquals(pStat.getTotalMsgsSent(), pStat.getTotalAcksReceived());
-        assertEquals(cStat.getTotalMsgsReceived(), cStat.getTotalAcksSent());
+        if (verifyAckCount) {
+            assertEquals(cStat.getTotalMsgsReceived(), cStat.getTotalAcksSent());
+        }
     }
 
 }

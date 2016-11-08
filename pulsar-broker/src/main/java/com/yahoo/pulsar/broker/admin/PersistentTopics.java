@@ -19,9 +19,9 @@ import static com.google.common.base.Preconditions.checkNotNull;
 
 import java.io.IOException;
 import java.io.OutputStream;
-import java.sql.Date;
-import java.text.SimpleDateFormat;
-import java.util.Collections;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -59,10 +59,16 @@ import org.slf4j.LoggerFactory;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
-import io.swagger.annotations.Api;
-import io.swagger.annotations.ApiOperation;
-import io.swagger.annotations.ApiResponse;
-import io.swagger.annotations.ApiResponses;
+import com.yahoo.pulsar.broker.service.BrokerServiceException.NotAllowedException;
+import com.yahoo.pulsar.broker.service.BrokerServiceException.SubscriptionBusyException;
+import com.yahoo.pulsar.broker.service.BrokerServiceException.SubscriptionInvalidCursorPosition;
+import com.yahoo.pulsar.broker.service.BrokerServiceException.TopicBusyException;
+import com.yahoo.pulsar.broker.service.persistent.PersistentReplicator;
+import com.yahoo.pulsar.broker.service.persistent.PersistentSubscription;
+import com.yahoo.pulsar.broker.service.persistent.PersistentTopic;
+import com.yahoo.pulsar.broker.web.RestException;
+import com.yahoo.pulsar.client.admin.PulsarAdminException.NotFoundException;
+import com.yahoo.pulsar.client.admin.PulsarAdminException.PreconditionFailedException;
 import com.yahoo.pulsar.common.api.Commands;
 import com.yahoo.pulsar.common.api.proto.PulsarApi.KeyValue;
 import com.yahoo.pulsar.common.api.proto.PulsarApi.MessageMetadata;
@@ -79,20 +85,14 @@ import com.yahoo.pulsar.common.policies.data.PersistentTopicInternalStats;
 import com.yahoo.pulsar.common.policies.data.PersistentTopicStats;
 import com.yahoo.pulsar.common.policies.data.Policies;
 import com.yahoo.pulsar.common.util.Codec;
-import com.yahoo.pulsar.broker.service.BrokerServiceException.NotAllowedException;
-import com.yahoo.pulsar.broker.service.BrokerServiceException.SubscriptionBusyException;
-import com.yahoo.pulsar.broker.service.BrokerServiceException.SubscriptionInvalidCursorPosition;
-import com.yahoo.pulsar.broker.service.BrokerServiceException.TopicBusyException;
-import com.yahoo.pulsar.broker.service.persistent.PersistentReplicator;
-import com.yahoo.pulsar.broker.service.persistent.PersistentSubscription;
-import com.yahoo.pulsar.broker.service.persistent.PersistentTopic;
-import com.yahoo.pulsar.broker.web.RestException;
-import com.yahoo.pulsar.client.admin.PulsarAdminException.NotFoundException;
-import com.yahoo.pulsar.client.admin.PulsarAdminException.PreconditionFailedException;
 import com.yahoo.pulsar.zookeeper.ZooKeeperCache.Deserializer;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
+import io.swagger.annotations.Api;
+import io.swagger.annotations.ApiOperation;
+import io.swagger.annotations.ApiResponse;
+import io.swagger.annotations.ApiResponses;
 
 /**
  */
@@ -102,7 +102,7 @@ import io.netty.buffer.PooledByteBufAllocator;
 public class PersistentTopics extends AdminResource {
     private static final Logger log = LoggerFactory.getLogger(PersistentTopics.class);
 
-    private static final SimpleDateFormat DATE_FORMAT = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS");
+    private static final DateTimeFormatter DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS").withZone(ZoneId.systemDefault());
 
     private static final String PARTITIONED_TOPIC_PATH_ZNODE = "partitioned-topics";
     private static final int PARTITIONED_TOPIC_WAIT_SYNC_TIME_MS = 1000;
@@ -147,7 +147,7 @@ public class PersistentTopics extends AdminResource {
             throw new RestException(e);
         }
 
-        Collections.sort(destinations);
+        destinations.sort(null);
         return destinations;
     }
 
@@ -166,7 +166,8 @@ public class PersistentTopics extends AdminResource {
         String destinationUri = DestinationName.get(domain(), property, cluster, namespace, destination).toString();
 
         try {
-            Policies policies = policiesCache().get(path("policies", property, cluster, namespace));
+            Policies policies = policiesCache().get(path("policies", property, cluster, namespace))
+                    .orElseThrow(() -> new RestException(Status.NOT_FOUND, "Namespace does not exist"));
 
             Map<String, Set<AuthAction>> permissions = Maps.newTreeMap();
             AuthPolicies auth = policies.auth_policies;
@@ -193,11 +194,6 @@ public class PersistentTopics extends AdminResource {
             }
 
             return permissions;
-
-        } catch (KeeperException.NoNodeException e) {
-            log.warn("[{}] Failed to get permissions for destination {}: Namespace does not exist", clientAppId(),
-                    destinationUri);
-            throw new RestException(Status.NOT_FOUND, "Namespace does not exist");
         } catch (Exception e) {
             log.error("[{}] Failed to get permissions for destination {}", clientAppId(), destinationUri, e);
             throw new RestException(e);
@@ -369,10 +365,11 @@ public class PersistentTopics extends AdminResource {
                 public PartitionedTopicMetadata deserialize(String key, byte[] content) throws Exception {
                     return jsonMapper().readValue(content, PartitionedTopicMetadata.class);
                 }
-            });
+            }).orElse(
+                    // if the partitioned topic is not found in zk, then the topic is not partitioned
+                    new PartitionedTopicMetadata());
         } catch (Exception e) {
-            // if the partitioned topic is not found in zk cache, it returns zero
-            partitionMetadata = new PartitionedTopicMetadata();
+            throw new RestException(e);
         }
 
         if (log.isDebugEnabled()) {
@@ -707,6 +704,92 @@ public class PersistentTopics extends AdminResource {
             throw new RestException(exception);
         }
     }
+    
+    @POST
+    @Path("/{property}/{cluster}/{namespace}/{destination}/subscription/{subName}/expireMessages/{expireTimeInSeconds}")
+    @ApiOperation(value = "Expire messages on a topic subscription.")
+    @ApiResponses(value = { @ApiResponse(code = 403, message = "Don't have admin permission"),
+            @ApiResponse(code = 404, message = "Topic or subscription does not exist") })
+    public void expireMessages(@PathParam("property") String property, @PathParam("cluster") String cluster,
+            @PathParam("namespace") String namespace, @PathParam("destination") String destination,
+            @PathParam("subName") String subName, @PathParam("expireTimeInSeconds") int expireTimeInSeconds,
+            @QueryParam("authoritative") @DefaultValue("false") boolean authoritative) {
+        DestinationName dn = DestinationName.get(domain(), property, cluster, namespace, destination);
+        PartitionedTopicMetadata partitionMetadata = getPartitionedTopicMetadata(property, cluster, namespace,
+                destination, authoritative);
+        if (partitionMetadata.partitions > 0) {
+            // expire messages for each partition destination
+            try {
+                for (int i = 0; i < partitionMetadata.partitions; i++) {
+                    pulsar().getAdminClient().persistentTopics().expireMessages(dn.getPartition(i).toString(), subName,
+                            expireTimeInSeconds);
+                }
+            } catch (Exception e) {
+                throw new RestException(e);
+            }
+        } else {
+            // validate ownership and redirect if current broker is not owner
+            validateAdminOperationOnDestination(dn, authoritative);
+            PersistentTopic topic = getTopicReference(dn);
+            try {
+                if (subName.startsWith(topic.replicatorPrefix)) {
+                    String remoteCluster = PersistentReplicator.getRemoteCluster(subName);
+                    PersistentReplicator repl = topic.getPersistentReplicator(remoteCluster);
+                    checkNotNull(repl);
+                    repl.expireMessages(expireTimeInSeconds);
+                } else {
+                    PersistentSubscription sub = topic.getPersistentSubscription(subName);
+                    checkNotNull(sub);
+                    sub.expireMessages(expireTimeInSeconds);
+                }
+                log.info("[{}] Message expire started up to {} on {} {}", clientAppId(), expireTimeInSeconds, dn,
+                        subName);
+            } catch (NullPointerException npe) {
+                throw new RestException(Status.NOT_FOUND, "Subscription not found");
+            } catch (Exception exception) {
+                log.error("[{}] Failed to expire messages up to {} on {} with subscription {} {}", clientAppId(),
+                        expireTimeInSeconds, dn, subName, exception);
+                throw new RestException(exception);
+            }
+        }
+    }
+    
+    @POST
+    @Path("/{property}/{cluster}/{namespace}/{destination}/all_subscription/expireMessages/{expireTimeInSeconds}")
+    @ApiOperation(value = "Expire messages on all subscriptions of topic.")
+    @ApiResponses(value = { @ApiResponse(code = 403, message = "Don't have admin permission"),
+            @ApiResponse(code = 404, message = "Topic or subscription does not exist") })
+    public void expireMessagesForAllSubscriptions(@PathParam("property") String property,
+            @PathParam("cluster") String cluster, @PathParam("namespace") String namespace,
+            @PathParam("destination") String destination, @PathParam("expireTimeInSeconds") int expireTimeInSeconds,
+            @QueryParam("authoritative") @DefaultValue("false") boolean authoritative) {
+        DestinationName dn = DestinationName.get(domain(), property, cluster, namespace, destination);
+        PartitionedTopicMetadata partitionMetadata = getPartitionedTopicMetadata(property, cluster, namespace,
+                destination, authoritative);
+        if (partitionMetadata.partitions > 0) {
+            try {
+                // expire messages for each partition destination
+                for (int i = 0; i < partitionMetadata.partitions; i++) {
+                    pulsar().getAdminClient().persistentTopics()
+                            .expireMessagesForAllSubscriptions(dn.getPartition(i).toString(), expireTimeInSeconds);
+                }
+            } catch (Exception e) {
+                log.error("[{}] Failed to expire messages up to {} on {} {}", clientAppId(), expireTimeInSeconds, dn,
+                        e);
+                throw new RestException(e);
+            }
+        } else {
+            // validate ownership and redirect if current broker is not owner
+            validateAdminOperationOnDestination(dn, authoritative);
+            PersistentTopic topic = getTopicReference(dn);
+            topic.getReplicators().forEach((subName, replicator) -> {
+                expireMessages(property, cluster, namespace, destination, subName, expireTimeInSeconds, authoritative);
+            });
+            topic.getSubscriptions().forEach((subName, subscriber) -> {
+                expireMessages(property, cluster, namespace, destination, subName, expireTimeInSeconds, authoritative);
+            });
+        }
+    }
 
     @POST
     @Path("/{property}/{cluster}/{namespace}/{destination}/subscription/{subName}/resetcursor/{timestamp}")
@@ -761,9 +844,6 @@ public class PersistentTopics extends AdminResource {
             try {
                 PersistentSubscription sub = topic.getPersistentSubscription(subName);
                 checkNotNull(sub);
-                if (dn.isGlobal()) {
-                    throw new NotAllowedException("reset cursor not supported for global topic");
-                }
                 sub.resetCursor(timestamp).get();
                 log.info("[{}][{}] reset cursor on subscription {} to time {}", clientAppId(), dn, subName, timestamp);
             } catch (Exception e) {
@@ -831,7 +911,7 @@ public class PersistentTopics extends AdminResource {
             }
             if (metadata.hasPublishTime()) {
                 responseBuilder.header("X-Pulsar-publish-time",
-                        DATE_FORMAT.format(new Date(metadata.getPublishTime())));
+                        DATE_FORMAT.format(Instant.ofEpochMilli(metadata.getPublishTime())));
             }
 
             // Decode if needed
@@ -903,7 +983,7 @@ public class PersistentTopics extends AdminResource {
             }
             final ManagedLedgerConfig config = pulsar().getBrokerService().getManagedLedgerConfig(dn).get();
             ManagedLedgerOfflineBacklog offlineTopicBacklog = new ManagedLedgerOfflineBacklog(config.getDigestType(),
-                    config.getPassword(), pulsar().getHost(), false);
+                    config.getPassword(), pulsar().getAdvertisedAddress(), false);
             offlineTopicStats = offlineTopicBacklog
                     .estimateUnloadedTopicBacklog((ManagedLedgerFactoryImpl) pulsar().getManagedLedgerFactory(), dn);
             pulsar().getBrokerService().cacheOfflineTopicStats(dn, offlineTopicStats);

@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.yahoo.pulsar.common.api.proto;
+package pulsar.proto;
 option java_package = "com.yahoo.pulsar.common.api.proto";
 option optimize_for = LITE_RUNTIME;
 
@@ -50,8 +50,9 @@ message MessageMetadata {
 	repeated string replicate_to    = 7;
 	optional CompressionType compression = 8 [default = NONE];
 	optional uint32 uncompressed_size = 9 [default = 0];
-	// XXHash64 checksum of the original message payload
-	optional sfixed64 checksum = 10;
+	// Removed below checksum field from Metadata as
+	// it should be part of send-command which keeps checksum of header + payload
+	//optional sfixed64 checksum = 10;
 	// differentiate single and batch message metadata
 	optional int32 num_messages_in_batch = 11 [default = 1];
 }
@@ -75,6 +76,7 @@ enum ServerError {
     ServiceNotReady     = 6; // Any error that requires client retry operation with a fresh lookup
     ProducerBlockedQuotaExceededError = 7; // Unable to create producer because backlog quota exceeded
     ProducerBlockedQuotaExceededException = 8; // Exception while creating producer because quota exceeded
+    ChecksumError = 9; // Error while verifying message checksum
 }
 
 enum AuthMethod {
@@ -92,6 +94,7 @@ enum ProtocolVersion {
 	v3 = 3;  // Added compression with LZ4 and ZLib
 	v4 = 4;  // Added batch message support
 	v5 = 5;  // Added disconnect client w/o closing connection
+	v6 = 6;  // Added checksum computation for metadata + payload
 }
 
 message CommandConnect {
@@ -137,7 +140,7 @@ message CommandProducer {
 message CommandSend {
 	required uint64 producer_id   = 1;
 	required uint64 sequence_id   = 2;
-	optional int32 num_messages = 3 [default = 1];;
+	optional int32 num_messages = 3 [default = 1];
 }
 
 message CommandSendReceipt {
@@ -206,6 +209,7 @@ message CommandCloseConsumer {
 
 message CommandRedeliverUnacknowledgedMessages {
 	required uint64 consumer_id = 1;
+	repeated MessageIdData message_ids = 2;
 }
 
 message CommandSuccess {
@@ -260,7 +264,7 @@ message BaseCommand {
 
 		PING = 18;
 		PONG = 19;
-		
+
 		REDELIVER_UNACKNOWLEDGED_MESSAGES = 20;
 	}
 
@@ -290,4 +294,3 @@ message BaseCommand {
 	optional CommandPong pong = 19;
 	optional CommandRedeliverUnacknowledgedMessages redeliverUnacknowledgedMessages = 20;
 }
-

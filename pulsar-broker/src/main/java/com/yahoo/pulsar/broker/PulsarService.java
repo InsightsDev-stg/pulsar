@@ -16,10 +16,10 @@
 package com.yahoo.pulsar.broker;
 
 import java.io.IOException;
-import java.net.InetAddress;
 import java.net.URL;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -55,8 +55,9 @@ import com.yahoo.pulsar.broker.web.WebService;
 import com.yahoo.pulsar.client.admin.PulsarAdmin;
 import com.yahoo.pulsar.client.util.FutureUtil;
 import com.yahoo.pulsar.common.naming.DestinationName;
+import com.yahoo.pulsar.common.naming.NamespaceBundle;
 import com.yahoo.pulsar.common.naming.NamespaceName;
-import com.yahoo.pulsar.common.naming.ServiceUnitId;
+import com.yahoo.pulsar.common.policies.data.ClusterData;
 import com.yahoo.pulsar.websocket.WebSocketConsumerServlet;
 import com.yahoo.pulsar.websocket.WebSocketProducerServlet;
 import com.yahoo.pulsar.websocket.WebSocketService;
@@ -97,7 +98,8 @@ public class PulsarService implements AutoCloseable {
     private LoadManager loadManager = null;
     private PulsarAdmin adminClient = null;
     private ZooKeeperClientFactory zkClientFactory = null;
-    private final String host;
+    private final String bindAddress;
+    private final String advertisedAddress;
     private final String webServiceAddress;
     private final String webServiceAddressTls;
     private final String brokerServiceUrl;
@@ -118,7 +120,8 @@ public class PulsarService implements AutoCloseable {
 
     public PulsarService(ServiceConfiguration config) {
         state = State.Init;
-        this.host = host(config);
+        this.bindAddress = ServiceConfigurationUtils.getDefaultOrConfiguredAddress(config.getBindAddress());
+        this.advertisedAddress = advertisedAddress(config);
         this.webServiceAddress = webAddress(config);
         this.webServiceAddressTls = webAddressTls(config);
         this.brokerServiceUrl = brokerUrl(config);
@@ -180,7 +183,7 @@ public class PulsarService implements AutoCloseable {
                 adminClient.close();
                 adminClient = null;
             }
-            
+
             nsservice = null;
 
             // executor is not initialized in mocks even when real close method is called
@@ -243,13 +246,15 @@ public class PulsarService implements AutoCloseable {
             LOG.info("Starting Pulsar Broker service");
             brokerService.start();
 
-            this.webService = new WebService(config, this);
+            this.webService = new WebService(this);
             this.webService.addRestResources("/", "com.yahoo.pulsar.broker.web", false);
             this.webService.addRestResources("/admin", "com.yahoo.pulsar.broker.admin", true);
             this.webService.addRestResources("/lookup", "com.yahoo.pulsar.broker.lookup", true);
 
             if (config.isWebSocketServiceEnabled()) {
-                this.webSocketService = new WebSocketService(config);
+                // Use local broker address to avoid different IP address when using a VIP for service discovery
+                this.webSocketService = new WebSocketService(new ClusterData(webServiceAddress, webServiceAddressTls),
+                        config);
                 this.webSocketService.start();
                 this.webService.addServlet(WebSocketProducerServlet.SERVLET_PATH,
                         new ServletHolder(new WebSocketProducerServlet(webSocketService)), true);
@@ -319,10 +324,18 @@ public class PulsarService implements AutoCloseable {
         try {
             // Namespace not created hence no need to unload it
             if (!this.globalZkCache.exists(
-                    AdminResource.path("policies") + "/" + NamespaceService.getSLAMonitorNamespace(host, config))) {
+                    AdminResource.path("policies") + "/" + NamespaceService.getSLAMonitorNamespace(getAdvertisedAddress(), config))) {
                 return;
             }
-            if (!this.nsservice.registerSLANamespace()) {
+
+            boolean acquiredSLANamespace;
+            try {
+                acquiredSLANamespace = nsservice.registerSLANamespace();
+            } catch (PulsarServerException e) {
+                acquiredSLANamespace = false;
+            }
+
+            if (!acquiredSLANamespace) {
                 this.nsservice.unloadSLANamespace();
             }
         } catch (Exception ex) {
@@ -357,10 +370,10 @@ public class PulsarService implements AutoCloseable {
 
         LOG.info("starting configuration cache service");
 
-        this.localZkCache = new LocalZooKeeperCache(getZkClient(), this.orderedExecutor);
+        this.localZkCache = new LocalZooKeeperCache(getZkClient(), getOrderedExecutor());
         this.globalZkCache = new GlobalZooKeeperCache(getZooKeeperClientFactory(),
                 (int) config.getZooKeeperSessionTimeoutMillis(), config.getGlobalZookeeperServers(),
-                this.orderedExecutor, this.executor);
+                getOrderedExecutor(), this.executor);
         try {
             this.globalZkCache.start();
         } catch (IOException e) {
@@ -412,40 +425,43 @@ public class PulsarService implements AutoCloseable {
     /**
      * Load all the destination contained in a namespace
      *
-     * @param suName
-     *            <code>ServiceUnitId</code> to identify the service unit
+     * @param bundle
+     *            <code>NamespaceBundle</code> to identify the service unit
      * @throws Exception
      */
-    public void loadNamespaceDestinations(ServiceUnitId suName) throws Exception {
-        LOG.info("Loading all topics on service unit: {}", suName);
+    public void loadNamespaceDestinations(NamespaceBundle bundle) {
+        executor.submit(() -> {
+            LOG.info("Loading all topics on bundle: {}", bundle);
 
-        NamespaceName nsName = suName.getNamespaceObject();
-        List<CompletableFuture<Topic>> persistentTopics = Lists.newArrayList();
-        long topicLoadStart = System.nanoTime();
+            NamespaceName nsName = bundle.getNamespaceObject();
+            List<CompletableFuture<Topic>> persistentTopics = Lists.newArrayList();
+            long topicLoadStart = System.nanoTime();
 
-        for (String topic : getNamespaceService().getListOfDestinations(nsName.getProperty(), nsName.getCluster(),
-                nsName.getLocalName())) {
-            try {
-                DestinationName dn = DestinationName.get(topic);
-                if (suName.includes(dn)) {
-                    CompletableFuture<Topic> future = brokerService.getTopic(topic);
-                    if (future != null) {
-                        persistentTopics.add(future);
+            for (String topic : getNamespaceService().getListOfDestinations(nsName.getProperty(), nsName.getCluster(),
+                    nsName.getLocalName())) {
+                try {
+                    DestinationName dn = DestinationName.get(topic);
+                    if (bundle.includes(dn)) {
+                        CompletableFuture<Topic> future = brokerService.getTopic(topic);
+                        if (future != null) {
+                            persistentTopics.add(future);
+                        }
                     }
+                } catch (Throwable t) {
+                    LOG.warn("Failed to preload topic {}", topic, t);
                 }
-            } catch (Throwable t) {
-                LOG.warn("Failed to preload topic {}", topic, t);
             }
-        }
 
-        if (!persistentTopics.isEmpty()) {
-            FutureUtil.waitForAll(persistentTopics).thenRun(() -> {
-                double topicLoadTimeSeconds = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - topicLoadStart)
-                        / 1000.0;
-                LOG.info("Loaded {} topics on {} -- time taken: {} seconds", persistentTopics.size(), suName,
-                        topicLoadTimeSeconds);
-            });
-        }
+            if (!persistentTopics.isEmpty()) {
+                FutureUtil.waitForAll(persistentTopics).thenRun(() -> {
+                    double topicLoadTimeSeconds = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - topicLoadStart)
+                            / 1000.0;
+                    LOG.info("Loaded {} topics on {} -- time taken: {} seconds", persistentTopics.size(), bundle,
+                            topicLoadTimeSeconds);
+                });
+            }
+            return null;
+        });
     }
 
     // No need to synchronize since config is only init once
@@ -540,8 +556,7 @@ public class PulsarService implements AutoCloseable {
     public synchronized PulsarAdmin getAdminClient() throws PulsarServerException {
         if (this.adminClient == null) {
             try {
-                String adminApiUrl = "http://" + InetAddress.getLocalHost().getHostName() + ":"
-                        + this.getConfiguration().getWebServicePort();
+                String adminApiUrl = webAddress(config);
                 this.adminClient = new PulsarAdmin(new URL(adminApiUrl),
                         this.getConfiguration().getBrokerClientAuthenticationPlugin(),
                         this.getConfiguration().getBrokerClientAuthenticationParameters());
@@ -563,50 +578,44 @@ public class PulsarService implements AutoCloseable {
     }
 
     /**
-     * Derive the host
+     * Advertised service address.
      *
-     * @param isBindOnLocalhost
-     * @return
+     * @return Hostname or IP address the service advertises to the outside world.
      */
-    public static String host(ServiceConfiguration config) {
-        try {
-            if (!config.isBindOnLocalhost()) {
-                return InetAddress.getLocalHost().getHostName();
-            } else {
-                return "localhost";
-            }
-        } catch (Exception e) {
-            LOG.error(e.getMessage(), e);
-            throw new IllegalStateException("failed to find host", e);
-        }
+    public static String advertisedAddress(ServiceConfiguration config) {
+        return ServiceConfigurationUtils.getDefaultOrConfiguredAddress(config.getAdvertisedAddress());
     }
 
     public static String brokerUrl(ServiceConfiguration config) {
-        return "pulsar://" + host(config) + ":" + config.getBrokerServicePort();
+        return "pulsar://" + advertisedAddress(config) + ":" + config.getBrokerServicePort();
     }
 
     public static String brokerUrlTls(ServiceConfiguration config) {
         if (config.isTlsEnabled()) {
-            return "pulsar://" + host(config) + ":" + config.getBrokerServicePortTls();
+            return "pulsar://" + advertisedAddress(config) + ":" + config.getBrokerServicePortTls();
         } else {
             return "";
         }
     }
 
     public static String webAddress(ServiceConfiguration config) {
-        return String.format("http://%s:%d", host(config), config.getWebServicePort());
+        return String.format("http://%s:%d", advertisedAddress(config), config.getWebServicePort());
     }
 
     public static String webAddressTls(ServiceConfiguration config) {
         if (config.isTlsEnabled()) {
-            return String.format("https://%s:%d", host(config), config.getWebServicePortTls());
+            return String.format("https://%s:%d", advertisedAddress(config), config.getWebServicePortTls());
         } else {
             return "";
         }
     }
 
-    public String getHost() {
-        return host;
+    public String getBindAddress() {
+        return bindAddress;
+    }
+
+    public String getAdvertisedAddress() {
+        return advertisedAddress;
     }
 
     public String getWebServiceAddress() {

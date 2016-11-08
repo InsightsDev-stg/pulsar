@@ -17,21 +17,25 @@ package com.yahoo.pulsar.checksum.utils;
 
 import static com.scurrilous.circe.params.CrcParameters.CRC32C;
 
-import java.nio.ByteBuffer;
-
 import com.scurrilous.circe.IncrementalIntHash;
 import com.scurrilous.circe.crc.Sse42Crc32C;
 import com.scurrilous.circe.crc.StandardCrcProvider;
 
 import io.netty.buffer.ByteBuf;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class Crc32cChecksum {
 
+    private static final Logger log = LoggerFactory.getLogger(Crc32cChecksum.class);
     private final static IncrementalIntHash CRC32C_HASH;
 
     static {
         if (Sse42Crc32C.isSupported()) {
             CRC32C_HASH = new Crc32cSse42Provider().getIncrementalInt(CRC32C);
+            if (log.isDebugEnabled()) {
+                log.debug("SSE4.2 CRC32C provider initialized");
+            }
         } else {
             CRC32C_HASH = new StandardCrcProvider().getIncrementalInt(CRC32C);
         }
@@ -46,12 +50,32 @@ public class Crc32cChecksum {
      */
     public static int computeChecksum(ByteBuf payload) {
         if (payload.hasMemoryAddress() && (CRC32C_HASH instanceof Sse42Crc32C)) {
-            return CRC32C_HASH.calculate(payload.memoryAddress(), payload.readableBytes());
+            return CRC32C_HASH.calculate(payload.memoryAddress() + payload.readerIndex(), payload.readableBytes());
         } else if (payload.hasArray()) {
             return CRC32C_HASH.calculate(payload.array(), payload.arrayOffset() + payload.readerIndex(),
                     payload.readableBytes());
         } else {
             return CRC32C_HASH.calculate(payload.nioBuffer());
+        }
+    }
+    
+    
+    /**
+     * Computes incremental checksum with input previousChecksum and input payload
+     * 
+     * @param previousChecksum : previously computed checksum
+     * @param payload
+     * @return
+     */
+    public static int resumeChecksum(int previousChecksum, ByteBuf payload) {
+        if (payload.hasMemoryAddress() && (CRC32C_HASH instanceof Sse42Crc32C)) {
+            return CRC32C_HASH.resume(previousChecksum, payload.memoryAddress() + payload.readerIndex(),
+                    payload.readableBytes());
+        } else if (payload.hasArray()) {
+            return CRC32C_HASH.resume(previousChecksum, payload.array(), payload.arrayOffset() + payload.readerIndex(),
+                    payload.readableBytes());
+        } else {
+            return CRC32C_HASH.resume(previousChecksum, payload.nioBuffer());
         }
     }
 

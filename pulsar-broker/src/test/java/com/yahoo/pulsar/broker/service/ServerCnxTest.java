@@ -32,6 +32,7 @@ import static org.testng.Assert.assertTrue;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.util.ArrayList;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -71,6 +72,7 @@ import com.yahoo.pulsar.broker.service.ServerCnx.State;
 import com.yahoo.pulsar.broker.service.persistent.PersistentTopic;
 import com.yahoo.pulsar.broker.service.utils.ClientChannelHelper;
 import com.yahoo.pulsar.common.api.Commands;
+import com.yahoo.pulsar.common.api.Commands.ChecksumType;
 import com.yahoo.pulsar.common.api.proto.PulsarApi.AuthMethod;
 import com.yahoo.pulsar.common.api.proto.PulsarApi.CommandAck.AckType;
 import com.yahoo.pulsar.common.api.proto.PulsarApi.CommandConnected;
@@ -83,7 +85,7 @@ import com.yahoo.pulsar.common.api.proto.PulsarApi.MessageMetadata;
 import com.yahoo.pulsar.common.api.proto.PulsarApi.ProtocolVersion;
 import com.yahoo.pulsar.common.api.proto.PulsarApi.ServerError;
 import com.yahoo.pulsar.common.naming.DestinationName;
-import com.yahoo.pulsar.common.naming.ServiceUnitId;
+import com.yahoo.pulsar.common.naming.NamespaceBundle;
 import com.yahoo.pulsar.common.policies.data.AuthAction;
 import com.yahoo.pulsar.common.policies.data.Policies;
 import com.yahoo.pulsar.zookeeper.ZooKeeperDataCache;
@@ -138,6 +140,7 @@ public class ServerCnxTest {
         configCacheService = mock(ConfigurationCacheService.class);
         @SuppressWarnings("unchecked")
         ZooKeeperDataCache<Policies> zkDataCache = mock(ZooKeeperDataCache.class);
+        doReturn(Optional.empty()).when(zkDataCache).get(anyObject());
         doReturn(zkDataCache).when(configCacheService).policiesCache();
         doReturn(configCacheService).when(pulsar).getConfigurationCache();
 
@@ -146,7 +149,7 @@ public class ServerCnxTest {
 
         namespaceService = mock(NamespaceService.class);
         doReturn(namespaceService).when(pulsar).getNamespaceService();
-        doReturn(true).when(namespaceService).isServiceUnitOwned(any(ServiceUnitId.class));
+        doReturn(true).when(namespaceService).isServiceUnitOwned(any(NamespaceBundle.class));
         doReturn(true).when(namespaceService).isServiceUnitActive(any(DestinationName.class));
 
         setupMLAsyncCallbackMocks();
@@ -519,7 +522,7 @@ public class ServerCnxTest {
                 .setProducerName("prod-name").setSequenceId(0).build();
         ByteBuf data = Unpooled.buffer(1024);
 
-        clientCommand = Commands.newSend(1, 0, 1, messageMetadata, data);
+        clientCommand = Commands.newSend(1, 0, 1, ChecksumType.None, messageMetadata, data);
         channel.writeInbound(Unpooled.copiedBuffer(clientCommand));
         clientCommand.release();
 

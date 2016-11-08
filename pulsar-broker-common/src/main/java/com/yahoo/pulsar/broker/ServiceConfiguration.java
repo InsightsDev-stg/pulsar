@@ -43,9 +43,12 @@ public class ServiceConfiguration {
     private int webServicePort = 8080;
     // Port to use to server HTTPS request
     private int webServicePortTls = 8443;
-    // Control whether to bind directly on localhost rather than on normal
-    // hostname
-    private boolean bindOnLocalhost = false;
+
+    // Hostname or IP address the service binds on.
+    private String bindAddress = "0.0.0.0";
+
+    // Controls which hostname is advertised to the discovery service via ZooKeeper.
+    private String advertisedAddress;
 
     // Enable the WebSocket API service
     private boolean webSocketServiceEnabled = false;
@@ -77,8 +80,11 @@ public class ServiceConfiguration {
     private boolean clientLibraryVersionCheckAllowUnversioned = true;
     // Path for the file used to determine the rotation status for the broker
     // when responding to service discovery health checks
-    @FieldContext(required = true)
     private String statusFilePath;
+    // Max number of unacknowledged messages allowed to receive messages by a consumer on a shared subscription. Broker will stop sending
+    // messages to consumer once, this limit reaches until consumer starts acknowledging messages back
+    // Using a value of 0, is disabling unackedMessage-limit check and consumer can receive messages without any restriction
+    private int maxUnackedMessagesPerConsumer = 50000;
 
     /***** --- TLS --- ****/
     // Enable TLS
@@ -291,12 +297,20 @@ public class ServiceConfiguration {
         this.webServicePortTls = webServicePortTls;
     }
 
-    public boolean isBindOnLocalhost() {
-        return bindOnLocalhost;
+    public String getBindAddress() {
+        return this.bindAddress;
     }
 
-    public void setBindOnLocalhost(boolean bindOnLocalhost) {
-        this.bindOnLocalhost = bindOnLocalhost;
+    public void setBindAddress(String bindAddress) {
+        this.bindAddress = bindAddress;
+    }
+
+    public String getAdvertisedAddress() {
+        return this.advertisedAddress;
+    }
+
+    public void setAdvertisedAddress(String advertisedAddress) {
+        this.advertisedAddress = advertisedAddress;
     }
 
     public boolean isWebSocketServiceEnabled() {
@@ -393,6 +407,14 @@ public class ServiceConfiguration {
 
     public void setStatusFilePath(String statusFilePath) {
         this.statusFilePath = statusFilePath;
+    }
+    
+    public int getMaxUnackedMessagesPerConsumer() {
+        return maxUnackedMessagesPerConsumer;
+    }
+
+    public void setMaxUnackedMessagesPerConsumer(int maxUnackedMessagesPerConsumer) {
+        this.maxUnackedMessagesPerConsumer = maxUnackedMessagesPerConsumer;
     }
 
     public boolean isTlsEnabled() {

@@ -15,18 +15,22 @@
  */
 package com.yahoo.pulsar.broker.service.persistent;
 
+import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
+import com.yahoo.pulsar.common.api.proto.PulsarApi;
 import org.apache.bookkeeper.mledger.AsyncCallbacks.ReadEntriesCallback;
 import org.apache.bookkeeper.mledger.Entry;
 import org.apache.bookkeeper.mledger.ManagedCursor;
 import org.apache.bookkeeper.mledger.ManagedLedgerException;
 import org.apache.bookkeeper.mledger.ManagedLedgerException.TooManyRequestsException;
+import org.apache.bookkeeper.mledger.Position;
 import org.apache.bookkeeper.mledger.impl.PositionImpl;
+import org.apache.bookkeeper.mledger.proto.MLDataFormats;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -117,7 +121,7 @@ public class PersistentDispatcherMultipleConsumers implements Dispatcher, ReadEn
                 if (log.isDebugEnabled()) {
                     log.debug("[{}] Consumer are left, reading more entries", name);
                 }
-                consumer.getPendingAcks().forEach(pendingMessages -> {
+                consumer.getPendingAcks().forEach((pendingMessages, totalMsg) -> {
                     messagesToReplay.add(pendingMessages);
                 });
                 totalAvailablePermits -= consumer.getAvailablePermits();
@@ -147,7 +151,7 @@ public class PersistentDispatcherMultipleConsumers implements Dispatcher, ReadEn
     }
 
     private void readMoreEntries() {
-        if (totalAvailablePermits > 0) {
+        if (totalAvailablePermits > 0 && isAtleastOneConsumerAvailable()) {
             int messagesToRead = Math.min(totalAvailablePermits, readBatchSize);
 
             if (!messagesToReplay.isEmpty()) {
@@ -165,7 +169,16 @@ public class PersistentDispatcherMultipleConsumers implements Dispatcher, ReadEn
                 }
 
                 havePendingReplayRead = true;
-                cursor.asyncReplayEntries(messagesToReplayNow, this, ReadType.Replay);
+                Set<? extends Position> deletedMessages = cursor.asyncReplayEntries(messagesToReplayNow, this,
+                        ReadType.Replay);
+                // clear already acked positions from replay bucket
+                messagesToReplay.removeAll(deletedMessages);
+                // if all the entries are acked-entries and cleared up from messagesToReplay, try to read
+                // next entries as readCompletedEntries-callback was never called 
+                if ((messagesToReplayNow.size() - deletedMessages.size()) == 0) {
+                    havePendingReplayRead = false;
+                    readMoreEntries();
+                }
             } else if (!havePendingRead) {
                 if (log.isDebugEnabled()) {
                     log.debug("[{}] Schedule read of {} messages for {} consumers", name, messagesToRead,
@@ -253,7 +266,7 @@ public class PersistentDispatcherMultipleConsumers implements Dispatcher, ReadEn
             log.debug("[{}] Distributing {} messages to {} consumers", name, entries.size(), consumerList.size());
         }
 
-        while (entriesToDispatch > 0 && totalAvailablePermits > 0) {
+        while (entriesToDispatch > 0 && totalAvailablePermits > 0 && isAtleastOneConsumerAvailable()) {
             Consumer c = getNextConsumer();
             if (c == null) {
                 // Do nothing, cursor will be rewind at reconnection
@@ -266,7 +279,7 @@ public class PersistentDispatcherMultipleConsumers implements Dispatcher, ReadEn
             int messagesForC = Math.min(Math.min(entriesToDispatch, c.getAvailablePermits()), MaxRoundRobinBatchSize);
 
             if (messagesForC > 0) {
-                c.sendMessages(entries.subList(start, start + messagesForC));
+                int msgSent = c.sendMessages(entries.subList(start, start + messagesForC)).getRight();
 
                 if (readType == ReadType.Replay) {
                     entries.subList(start, start + messagesForC).forEach(entry -> {
@@ -275,7 +288,7 @@ public class PersistentDispatcherMultipleConsumers implements Dispatcher, ReadEn
                 }
                 start += messagesForC;
                 entriesToDispatch -= messagesForC;
-                totalAvailablePermits -= messagesForC;
+                totalAvailablePermits -= msgSent;
             }
         }
 
@@ -348,14 +361,59 @@ public class PersistentDispatcherMultipleConsumers implements Dispatcher, ReadEn
         if (consumerIndex >= consumerList.size()) {
             consumerIndex = 0;
         }
-        return consumerList.get(consumerIndex++);
+        
+        // find next available unblocked consumer
+        int unblockedConsumerIndex = consumerIndex;
+        do {
+            if (isConsumerAvailable(consumerList.get(unblockedConsumerIndex))) {
+                consumerIndex = unblockedConsumerIndex;
+                return consumerList.get(consumerIndex++);
+            }
+            if (++unblockedConsumerIndex >= consumerList.size()) {
+                unblockedConsumerIndex = 0;
+            }
+        } while (unblockedConsumerIndex != consumerIndex);
+
+        // not found unblocked consumer
+        return null;
+    }
+    
+    /**
+     * returns true only if {@link consumerList} has atleast one unblocked consumer and have available permits
+     * 
+     * @return
+     */
+    private boolean isAtleastOneConsumerAvailable() {
+        if (consumerList.isEmpty() || closeFuture != null) {
+            // abort read if no consumers are connected or if disconnect is initiated
+            return false;
+        }
+        for(Consumer consumer : consumerList) {
+            if (isConsumerAvailable(consumer)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    private boolean isConsumerAvailable(Consumer consumer) {
+        return consumer != null && !consumer.isBlocked() && consumer.getAvailablePermits() > 0;
     }
 
     @Override
     public synchronized void redeliverUnacknowledgedMessages(Consumer consumer) {
-        consumer.getPendingAcks().forEach(pendingMessages -> {
+        consumer.getPendingAcks().forEach((pendingMessages, totalMsg) -> {
             messagesToReplay.add(pendingMessages);
         });
+        if (log.isDebugEnabled()) {
+            log.debug("[{}] Redelivering unacknowledged messages for consumer ", consumer);
+        }
+        readMoreEntries();
+    }
+
+    @Override
+    public synchronized void redeliverUnacknowledgedMessages(Consumer consumer, List<PositionImpl> positions) {
+        messagesToReplay.addAll(positions);
         if (log.isDebugEnabled()) {
             log.debug("[{}] Redelivering unacknowledged messages for consumer ", consumer);
         }

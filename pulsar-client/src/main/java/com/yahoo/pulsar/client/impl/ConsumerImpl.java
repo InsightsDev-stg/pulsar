@@ -21,6 +21,7 @@ import static java.lang.String.format;
 
 import java.io.IOException;
 import java.util.BitSet;
+import java.util.List;
 import java.util.NavigableMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentSkipListMap;
@@ -29,7 +30,9 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.stream.Collectors;
 
+import com.google.common.collect.Lists;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -38,6 +41,7 @@ import com.yahoo.pulsar.client.api.ConsumerConfiguration;
 import com.yahoo.pulsar.client.api.Message;
 import com.yahoo.pulsar.client.api.MessageId;
 import com.yahoo.pulsar.client.api.PulsarClientException;
+import com.yahoo.pulsar.client.api.SubscriptionType;
 import com.yahoo.pulsar.client.util.FutureUtil;
 import com.yahoo.pulsar.common.api.Commands;
 import com.yahoo.pulsar.common.api.PulsarDecoder;
@@ -50,15 +54,17 @@ import com.yahoo.pulsar.common.api.proto.PulsarApi.MessageMetadata;
 import com.yahoo.pulsar.common.api.proto.PulsarApi.ProtocolVersion;
 import com.yahoo.pulsar.common.compression.CompressionCodec;
 import com.yahoo.pulsar.common.compression.CompressionCodecProvider;
-import com.yahoo.pulsar.common.util.XXHashChecksum;
 
 import io.netty.buffer.ByteBuf;
-import io.netty.buffer.ByteBufUtil;
 import io.netty.util.Timeout;
 import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.GenericFutureListener;
+import static com.yahoo.pulsar.common.api.Commands.readChecksum;
+import static com.yahoo.pulsar.checksum.utils.Crc32cChecksum.computeChecksum;
+import static com.yahoo.pulsar.common.api.Commands.hasChecksum;
 
 public class ConsumerImpl extends ConsumerBase {
+    private static final int MAX_REDELIVER_UNACKNOWLEDGED = 1000;
 
     private final long consumerId;
 
@@ -76,6 +82,9 @@ public class ConsumerImpl extends ConsumerBase {
 
     private final ReadWriteLock lock = new ReentrantReadWriteLock();
 
+    private final ReadWriteLock zeroQueueLock;
+
+    private final UnAckedMessageTracker unAckedMessageTracker;
     private final ConcurrentSkipListMap<MessageIdImpl, BitSet> batchMessageAckTracker;
 
     private final ConsumerStats stats;
@@ -100,7 +109,24 @@ public class ConsumerImpl extends ConsumerBase {
         } else {
             stats = ConsumerStats.CONSUMER_STATS_DISABLED;
         }
+
+        if (conf.getReceiverQueueSize() <= 1) {
+            zeroQueueLock = new ReentrantReadWriteLock();
+        } else {
+            zeroQueueLock = null;
+        }
+
+        if (conf.getAckTimeoutMillis() != 0) {
+            this.unAckedMessageTracker = new UnAckedMessageTracker(client, this, conf.getAckTimeoutMillis());
+        } else {
+            this.unAckedMessageTracker = UnAckedMessageTracker.UNACKED_MESSAGE_TRACKER_DISABLED;
+        }
+
         grabCnx();
+    }
+
+    public UnAckedMessageTracker getUnAckedMessageTracker() {
+        return unAckedMessageTracker;
     }
 
     @Override
@@ -118,9 +144,8 @@ public class ConsumerImpl extends ConsumerBase {
             cnx.sendRequestWithId(unsubscribe, requestId).thenRun(() -> {
                 cnx.removeConsumer(consumerId);
                 log.info("[{}][{}] Successfully unsubscribed from topic", topic, subscription);
-                if (unAckedMessageTracker != null) {
-                    unAckedMessageTracker.close();
-                }
+                batchMessageAckTracker.clear();
+                unAckedMessageTracker.close();
                 unsubscribeFuture.complete(null);
                 state.set(State.Closed);
             }).exceptionally(e -> {
@@ -138,15 +163,18 @@ public class ConsumerImpl extends ConsumerBase {
     @Override
     protected Message internalReceive() throws PulsarClientException {
         if (conf.getReceiverQueueSize() == 0) {
-            return fetchSingleMessageFromBroker();
+            checkArgument(zeroQueueLock != null, "Receiver queue size can't be modified");
+            zeroQueueLock.writeLock().lock();
+            try {
+                return fetchSingleMessageFromBroker();
+            } finally {
+                zeroQueueLock.writeLock().unlock();
+            }
         }
         Message message;
         try {
             message = incomingMessages.take();
             messageProcessed(message);
-            if (unAckedMessageTracker != null) {
-                unAckedMessageTracker.add((MessageIdImpl) message.getMessageId());
-            }
             return message;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -177,16 +205,13 @@ public class ConsumerImpl extends ConsumerBase {
             receiveMessages(cnx(), 1);
         } else if (message != null) {
             messageProcessed(message);
-            if (unAckedMessageTracker != null) {
-                unAckedMessageTracker.add((MessageIdImpl) message.getMessageId());
-            }
             result.complete(message);
         }
 
         return result;
     }
 
-    private synchronized Message fetchSingleMessageFromBroker() throws PulsarClientException {
+    private Message fetchSingleMessageFromBroker() throws PulsarClientException {
         checkArgument(conf.getReceiverQueueSize() == 0);
 
         // Just being cautious
@@ -199,8 +224,10 @@ public class ConsumerImpl extends ConsumerBase {
         try {
             // is cnx is null or if the connection breaks the connectionOpened function will send the flow again
             waitingOnReceiveForZeroQueueSize = true;
-            if (isConnected()) {
-                receiveMessages(cnx(), 1);
+            synchronized (this) {
+                if (isConnected()) {
+                    receiveMessages(cnx(), 1);
+                }
             }
             do {
                 message = incomingMessages.take();
@@ -216,9 +243,6 @@ public class ConsumerImpl extends ConsumerBase {
                 }
             } while (true);
 
-            if (unAckedMessageTracker != null) {
-                unAckedMessageTracker.add((MessageIdImpl) message.getMessageId());
-            }
             stats.updateNumMsgsReceived(message);
             return message;
         } catch (InterruptedException e) {
@@ -240,9 +264,6 @@ public class ConsumerImpl extends ConsumerBase {
             message = incomingMessages.poll(timeout, unit);
             if (message != null) {
                 messageProcessed(message);
-                if (unAckedMessageTracker != null) {
-                    unAckedMessageTracker.add((MessageIdImpl) message.getMessageId());
-                }
             }
             return message;
         } catch (InterruptedException e) {
@@ -258,7 +279,7 @@ public class ConsumerImpl extends ConsumerBase {
         // get entry before this message and ack that message on broker
         MessageIdImpl lowerKey = batchMessageAckTracker.lowerKey(message);
         if (lowerKey != null) {
-            NavigableMap entriesUpto = batchMessageAckTracker.headMap(lowerKey, true);
+            NavigableMap<MessageIdImpl, BitSet> entriesUpto = batchMessageAckTracker.headMap(lowerKey, true);
             for (Object key : entriesUpto.keySet()) {
                 entriesUpto.remove(key);
             }
@@ -287,6 +308,7 @@ public class ConsumerImpl extends ConsumerBase {
             return true;
         }
         int batchIndex = batchMessageId.getBatchIndex();
+        int batchSize = bitSet.length();
         if (ackType == AckType.Individual) {
             bitSet.clear(batchIndex);
         } else {
@@ -303,6 +325,11 @@ public class ConsumerImpl extends ConsumerBase {
                 batchMessageAckTracker.keySet().removeIf(m -> (m.compareTo(message) <= 0));
             }
             batchMessageAckTracker.remove(message);
+            // increment Acknowledge-msg counter with number of messages in batch only if AckType is Individual.
+            // CumulativeAckType is handled while sending ack to broker
+            if (ackType == AckType.Individual) {
+                stats.incrementNumAcksSent(batchSize);
+            }
             return true;
         } else {
             // we cannot ack this message to broker. but prior message may be ackable
@@ -326,7 +353,7 @@ public class ConsumerImpl extends ConsumerBase {
         }
         MessageIdImpl lowerKey = batchMessageAckTracker.lowerKey(message);
         if (lowerKey != null) {
-            NavigableMap entriesUpto = batchMessageAckTracker.headMap(lowerKey, true);
+            NavigableMap<MessageIdImpl, BitSet> entriesUpto = batchMessageAckTracker.headMap(lowerKey, true);
             for (Object key : entriesUpto.keySet()) {
                 entriesUpto.remove(key);
             }
@@ -339,12 +366,11 @@ public class ConsumerImpl extends ConsumerBase {
                 log.debug("[{}] [{}] no messages to clean up prior to message {}", subscription, consumerId, message);
             }
         }
-
     }
 
     /**
      * helper method that returns current state of data structure used to track acks for batch messages
-     * 
+     *
      * @return true if all batch messages have been acknowledged
      */
     public boolean isBatchingAckTrackerEmpty() {
@@ -370,7 +396,6 @@ public class ConsumerImpl extends ConsumerBase {
                 // other messages in batch are still pending ack.
                 return CompletableFuture.completedFuture(null);
             }
-
         }
         // if we got a cumulative ack on non batch message, check if any earlier batch messages need to be removed
         // from batch message tracker
@@ -393,19 +418,15 @@ public class ConsumerImpl extends ConsumerBase {
                 public void operationComplete(Future<Void> future) throws Exception {
                     if (future.isSuccess()) {
                         if (ackType == AckType.Individual) {
-                            if (unAckedMessageTracker != null) {
-                                unAckedMessageTracker.remove(msgId);
+                            unAckedMessageTracker.remove(msgId);
+                            // increment counter by 1 for non-batch msg
+                            if (!(messageId instanceof BatchMessageIdImpl)) {
+                                stats.incrementNumAcksSent(1);
                             }
-                            stats.incrementNumAcksSent(stats.getNumAcksTrackerSumThenReset());
                         } else if (ackType == AckType.Cumulative) {
-                            if (unAckedMessageTracker != null) {
-                                stats.incrementNumAcksSent(unAckedMessageTracker.removeMessagesTill(msgId));
-                            } else {
-                                stats.incrementNumAcksSent(stats.getNumAcksTrackerSumThenReset());
-                            }
+                            stats.incrementNumAcksSent(unAckedMessageTracker.removeMessagesTill(msgId));
                         }
                         ackFuture.complete(null);
-                        stats.resetNumAckTracker();
                     } else {
                         stats.incrementNumAcksFailed();
                         ackFuture.completeExceptionally(new PulsarClientException(future.cause()));
@@ -434,9 +455,8 @@ public class ConsumerImpl extends ConsumerBase {
                 requestId).thenRun(() -> {
                     synchronized (ConsumerImpl.this) {
                         incomingMessages.clear();
-                        if (unAckedMessageTracker != null) {
-                            unAckedMessageTracker.clear();
-                        }
+                        unAckedMessageTracker.clear();
+                        batchMessageAckTracker.clear();
                         if (changeToReadyState()) {
                             log.info("[{}][{}] Subscribed to topic on {} -- consumer: {}", topic, subscription,
                                     cnx.channel().remoteAddress(), consumerId);
@@ -519,9 +539,8 @@ public class ConsumerImpl extends ConsumerBase {
     @Override
     public CompletableFuture<Void> closeAsync() {
         if (state.get() == State.Closing || state.get() == State.Closed) {
-            if (unAckedMessageTracker != null) {
-                unAckedMessageTracker.close();
-            }
+            batchMessageAckTracker.clear();
+            unAckedMessageTracker.close();
             return CompletableFuture.completedFuture(null);
         }
 
@@ -529,9 +548,7 @@ public class ConsumerImpl extends ConsumerBase {
             log.info("[{}] [{}] Closed Consumer (not connected)", topic, subscription);
             state.set(State.Closed);
             batchMessageAckTracker.clear();
-            if (unAckedMessageTracker != null) {
-                unAckedMessageTracker.close();
-            }
+            unAckedMessageTracker.close();
             client.cleanupConsumer(this);
             return CompletableFuture.completedFuture(null);
         }
@@ -554,9 +571,7 @@ public class ConsumerImpl extends ConsumerBase {
                 log.info("[{}] [{}] Closed consumer", topic, subscription);
                 state.set(State.Closed);
                 batchMessageAckTracker.clear();
-                if (unAckedMessageTracker != null) {
-                    unAckedMessageTracker.close();
-                }
+                unAckedMessageTracker.close();
                 closeFuture.complete(null);
                 client.cleanupConsumer(this);
             } else {
@@ -575,6 +590,13 @@ public class ConsumerImpl extends ConsumerBase {
 
         MessageMetadata msgMetadata = null;
         ByteBuf payload = headersAndPayload;
+
+        if (!verifyChecksum(headersAndPayload, messageId)) {
+            // discard message with checksum error
+            discardCorruptedMessage(messageId, cnx, ValidationError.ChecksumMismatch);
+            return;
+        }
+
         try {
             msgMetadata = Commands.parseMessageMetadata(payload);
         } catch (Throwable t) {
@@ -585,11 +607,6 @@ public class ConsumerImpl extends ConsumerBase {
         ByteBuf uncompressedPayload = uncompressPayloadIfNeeded(messageId, msgMetadata, payload, cnx);
         if (uncompressedPayload == null) {
             // Message was discarded on decompression error
-            return;
-        }
-
-        if (!verifyChecksum(messageId, msgMetadata, uncompressedPayload, cnx)) {
-            // Message discarded for checksum error
             return;
         }
 
@@ -606,6 +623,7 @@ public class ConsumerImpl extends ConsumerBase {
                 // Enqueue the message so that it can be retrieved when application calls receive()
                 // if the conf.getReceiverQueueSize() is 0 then discard message if no one is waiting for it.
                 // if asyncReceive is waiting then notify callback without adding to incomingMessages queue
+                unAckedMessageTracker.add((MessageIdImpl) message.getMessageId());
                 boolean asyncReceivedWaiting = !pendingReceives.isEmpty();
                 if ((conf.getReceiverQueueSize() != 0 || waitingOnReceiveForZeroQueueSize) && !asyncReceivedWaiting) {
                     incomingMessages.add(message);
@@ -637,8 +655,6 @@ public class ConsumerImpl extends ConsumerBase {
             uncompressedPayload.release();
             msgMetadata.recycle();
         }
-
-        stats.incrementNumAcksTracker(numMessages);
 
         if (listener != null) {
             // Trigger the notification on the message listener in a separate thread to avoid blocking the networking
@@ -678,10 +694,6 @@ public class ConsumerImpl extends ConsumerBase {
             CompletableFuture<Message> receivedFuture = pendingReceives.poll();
             if (exception == null) {
                 checkNotNull(message, "received message can't be null");
-                // add message to unAckedMessage tracker
-                if (unAckedMessageTracker != null) {
-                    unAckedMessageTracker.add((MessageIdImpl) message.getMessageId());
-                }
                 if (receivedFuture != null) {
                     if (conf.getReceiverQueueSize() == 0) {
                         // return message to receivedCallback
@@ -713,6 +725,7 @@ public class ConsumerImpl extends ConsumerBase {
                     batchMessage, bitSet.cardinality(), bitSet.length());
         }
         batchMessageAckTracker.put(batchMessage, bitSet);
+        unAckedMessageTracker.add(batchMessage);
         try {
             for (int i = 0; i < batchSize; ++i) {
                 if (log.isDebugEnabled()) {
@@ -803,28 +816,21 @@ public class ConsumerImpl extends ConsumerBase {
         }
     }
 
-    private boolean verifyChecksum(MessageIdData messageId, MessageMetadata msgMetadata, ByteBuf payload,
-            ClientCnx currentCnx) {
-        if (!msgMetadata.hasChecksum()) {
-            // No checksum to validate
-            return true;
+    private boolean verifyChecksum(ByteBuf headersAndPayload, MessageIdData messageId) {
+
+        if(hasChecksum(headersAndPayload)) {
+            int checksum = readChecksum(headersAndPayload).intValue();
+            int computedChecksum = computeChecksum(headersAndPayload);
+            if (checksum != computedChecksum) {
+                log.error(
+                        "[{}][{}] Checksum mismatch for message at {}:{}. Received checksum: 0x{}, Computed checksum: 0x{}",
+                        topic, subscription, messageId.getLedgerId(), messageId.getEntryId(),
+                        Long.toHexString(checksum), Integer.toHexString(computedChecksum));
+                return false;
+            }
         }
 
-        long storedChecksum = msgMetadata.getChecksum();
-        long computedChecksum = XXHashChecksum.computeChecksum(payload);
-
-        if (storedChecksum == computedChecksum) {
-            return true;
-        } else {
-            log.error(
-                    "[{}][{}] Checksum mismatch for message at {}:{}. Received content:\n{}"
-                            + "\nReceived checksum: 0x{} -- Computed checksum: 0x{}",
-                    topic, subscription, messageId.getLedgerId(), messageId.getEntryId(),
-                    ByteBufUtil.prettyHexDump(payload), Long.toHexString(storedChecksum),
-                    Long.toHexString(computedChecksum));
-            discardCorruptedMessage(messageId, currentCnx, ValidationError.ChecksumMismatch);
-            return false;
-        }
+        return true;
     }
 
     private void discardCorruptedMessage(MessageIdData messageId, ClientCnx currentCnx,
@@ -852,10 +858,12 @@ public class ConsumerImpl extends ConsumerBase {
         return partitionIndex;
     }
 
+    @Override
     public int getAvailablePermits() {
         return availablePermits.get();
     }
 
+    @Override
     public int numMessagesInQueue() {
         return incomingMessages.size();
     }
@@ -864,10 +872,52 @@ public class ConsumerImpl extends ConsumerBase {
     public void redeliverUnacknowledgedMessages() {
         ClientCnx cnx = cnx();
         if (isConnected() && cnx.getRemoteEndpointProtocolVersion() >= ProtocolVersion.v2.getNumber()) {
-            if (unAckedMessageTracker != null) {
+            int currentSize = 0;
+            synchronized (this) {
+                currentSize = incomingMessages.size();
+                incomingMessages.clear();
+                availablePermits.set(0);
                 unAckedMessageTracker.clear();
+                batchMessageAckTracker.clear();
             }
             cnx.ctx().writeAndFlush(Commands.newRedeliverUnacknowledgedMessages(consumerId), cnx.ctx().voidPromise());
+            if (currentSize > 0) {
+                receiveMessages(cnx, currentSize);
+            }
+            return;
+        }
+        if (cnx == null || (state.get() == State.Connecting)) {
+            log.warn("[{}] Client Connection needs to be establised for redelivery of unacknowledged messages", this);
+        } else {
+            log.warn("[{}] Reconnecting the client to redeliver the messages.", this);
+            cnx.ctx().close();
+        }
+    }
+
+    @Override
+    public void redeliverUnacknowledgedMessages(List<MessageIdImpl> messageIds) {
+        if (conf.getSubscriptionType() != SubscriptionType.Shared) {
+            // We cannot redeliver single messages if subscription type is not Shared
+            redeliverUnacknowledgedMessages();
+            return;
+        }
+        ClientCnx cnx = cnx();
+        if (isConnected() && cnx.getRemoteEndpointProtocolVersion() >= ProtocolVersion.v2.getNumber()) {
+            List<List<MessageIdImpl>> batches = Lists.partition(messageIds, MAX_REDELIVER_UNACKNOWLEDGED);
+            MessageIdData.Builder builder = MessageIdData.newBuilder();
+            batches.forEach(ids -> {
+                List<MessageIdData> messageIdDatas = ids.stream()
+                        .map(messageId -> {
+                            builder.setPartition(messageId.getPartitionIndex());
+                            builder.setLedgerId(messageId.getLedgerId());
+                            builder.setEntryId(messageId.getEntryId());
+                            return builder.build();
+                        }).collect(Collectors.toList());
+                ByteBuf cmd = Commands.newRedeliverUnacknowledgedMessages(consumerId, messageIdDatas);
+                cnx.ctx().writeAndFlush(cmd, cnx.ctx().voidPromise());
+                messageIdDatas.forEach(MessageIdData::recycle);
+            });
+            builder.recycle();
             return;
         }
         if (cnx == null || (state.get() == State.Connecting)) {

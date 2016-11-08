@@ -18,7 +18,6 @@ package com.yahoo.pulsar.broker.service.persistent;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkNotNull;
 
-import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
@@ -30,16 +29,17 @@ import org.apache.bookkeeper.mledger.Entry;
 import org.apache.bookkeeper.mledger.ManagedCursor;
 import org.apache.bookkeeper.mledger.ManagedLedgerException;
 import org.apache.bookkeeper.mledger.ManagedLedgerException.TooManyRequestsException;
+import org.apache.bookkeeper.mledger.impl.PositionImpl;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.yahoo.pulsar.common.api.proto.PulsarApi.CommandSubscribe.SubType;
-import com.yahoo.pulsar.broker.service.Consumer;
-import com.yahoo.pulsar.broker.service.Dispatcher;
 import com.yahoo.pulsar.broker.service.BrokerServiceException;
 import com.yahoo.pulsar.broker.service.BrokerServiceException.ConsumerBusyException;
 import com.yahoo.pulsar.broker.service.BrokerServiceException.ServerMetadataException;
+import com.yahoo.pulsar.broker.service.Consumer;
+import com.yahoo.pulsar.broker.service.Dispatcher;
 import com.yahoo.pulsar.client.impl.Backoff;
+import com.yahoo.pulsar.common.api.proto.PulsarApi.CommandSubscribe.SubType;
 import com.yahoo.pulsar.utils.CopyOnWriteArrayList;
 
 public final class PersistentDispatcherSingleActiveConsumer implements Dispatcher, ReadEntriesCallback {
@@ -72,7 +72,7 @@ public final class PersistentDispatcherSingleActiveConsumer implements Dispatche
     private void pickAndScheduleActiveConsumer() {
         checkArgument(!consumers.isEmpty());
 
-        Collections.sort(consumers, (c1, c2) -> c1.consumerName().compareTo(c2.consumerName()));
+        consumers.sort((c1, c2) -> c1.consumerName().compareTo(c2.consumerName()));
 
         int index = partitionIndex % consumers.size();
         Consumer prevConsumer = activeConsumer.getAndSet(consumers.get(index));
@@ -199,7 +199,7 @@ public final class PersistentDispatcherSingleActiveConsumer implements Dispatche
                 readMoreEntries(currentConsumer);
             }
         } else {
-            currentConsumer.sendMessages(entries).addListener(future -> {
+            currentConsumer.sendMessages(entries).getLeft().addListener(future -> {
                 if (future.isSuccess()) {
                     // Schedule a new read batch operation only after the previous batch has been written to the socket
                     synchronized (PersistentDispatcherSingleActiveConsumer.this) {
@@ -260,6 +260,12 @@ public final class PersistentDispatcherSingleActiveConsumer implements Dispatche
             log.info("[{}] Ignoring reDeliverUnAcknowledgedMessages: cancelPendingRequest on cursor failed", consumer);
         }
 
+    }
+
+    @Override
+    public void redeliverUnacknowledgedMessages(Consumer consumer, List<PositionImpl> positions) {
+        // We cannot redeliver single messages to single consumers to preserve ordering.
+        redeliverUnacknowledgedMessages(consumer);
     }
 
     private void readMoreEntries(Consumer consumer) {

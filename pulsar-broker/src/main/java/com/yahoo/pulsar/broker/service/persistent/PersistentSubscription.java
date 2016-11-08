@@ -15,6 +15,7 @@
  */
 package com.yahoo.pulsar.broker.service.persistent;
 
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -37,15 +38,15 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Objects;
-import com.yahoo.pulsar.broker.service.Consumer;
-import com.yahoo.pulsar.broker.service.Dispatcher;
 import com.yahoo.pulsar.broker.service.BrokerServiceException;
-import com.yahoo.pulsar.broker.service.Subscription;
 import com.yahoo.pulsar.broker.service.BrokerServiceException.PersistenceException;
 import com.yahoo.pulsar.broker.service.BrokerServiceException.ServerMetadataException;
 import com.yahoo.pulsar.broker.service.BrokerServiceException.SubscriptionBusyException;
 import com.yahoo.pulsar.broker.service.BrokerServiceException.SubscriptionFencedException;
 import com.yahoo.pulsar.broker.service.BrokerServiceException.SubscriptionInvalidCursorPosition;
+import com.yahoo.pulsar.broker.service.Consumer;
+import com.yahoo.pulsar.broker.service.Dispatcher;
+import com.yahoo.pulsar.broker.service.Subscription;
 import com.yahoo.pulsar.common.api.proto.PulsarApi.CommandAck.AckType;
 import com.yahoo.pulsar.common.api.proto.PulsarApi.CommandSubscribe.SubType;
 import com.yahoo.pulsar.common.naming.DestinationName;
@@ -500,6 +501,8 @@ public class PersistentSubscription implements Subscription {
     public CompletableFuture<Void> delete() {
         CompletableFuture<Void> deleteFuture = new CompletableFuture<>();
 
+        log.info("[{}][{}] Unsubscribing", topicName, subName);
+
         // cursor close handles pending delete (ack) operations
         this.close().thenCompose(v -> topic.unsubscribe(subName)).thenAccept(v -> deleteFuture.complete(null))
                 .exceptionally(exception -> {
@@ -572,6 +575,8 @@ public class PersistentSubscription implements Subscription {
                 subStats.consumers.add(consumerStats);
                 subStats.msgRateOut += consumerStats.msgRateOut;
                 subStats.msgThroughputOut += consumerStats.msgThroughputOut;
+                subStats.msgRateRedeliver += consumerStats.msgRateRedeliver;
+                subStats.unackedMessages += consumerStats.unackedMessages;
             });
         }
 
@@ -584,6 +589,11 @@ public class PersistentSubscription implements Subscription {
     @Override
     public synchronized void redeliverUnacknowledgedMessages(Consumer consumer) {
         dispatcher.redeliverUnacknowledgedMessages(consumer);
+    }
+
+    @Override
+    public synchronized void redeliverUnacknowledgedMessages(Consumer consumer, List<PositionImpl> positions) {
+        dispatcher.redeliverUnacknowledgedMessages(consumer, positions);
     }
 
     private static final Logger log = LoggerFactory.getLogger(PersistentSubscription.class);

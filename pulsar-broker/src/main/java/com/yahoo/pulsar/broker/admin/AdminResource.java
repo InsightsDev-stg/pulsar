@@ -19,7 +19,6 @@ import static com.google.common.base.Preconditions.checkArgument;
 
 import java.net.MalformedURLException;
 import java.net.URI;
-import java.util.Collections;
 import java.util.List;
 import java.util.Set;
 
@@ -119,19 +118,6 @@ public abstract class AdminResource extends PulsarWebResource {
 
     // This is a stub method for Mockito
     @Override
-    protected void validateNamespaceOwnership(String property, String cluster, String namespace) {
-        super.validateNamespaceOwnership(property, cluster, namespace);
-    }
-
-    // This is a stub method for Mockito
-    @Override
-    protected void validateNamespaceOwnership(String property, String cluster, String namespace, boolean authoritative,
-            boolean readOnly) {
-        super.validateNamespaceOwnership(property, cluster, namespace, authoritative, readOnly);
-    }
-
-    // This is a stub method for Mockito
-    @Override
     protected void validateNamespaceOwnershipWithBundles(String property, String cluster, String namespace,
             boolean authoritative, boolean readOnly, BundlesData bundleData) {
         super.validateNamespaceOwnershipWithBundles(property, cluster, namespace, authoritative, readOnly, bundleData);
@@ -207,7 +193,7 @@ public abstract class AdminResource extends PulsarWebResource {
             }
         }
 
-        Collections.sort(namespaces);
+        namespaces.sort(null);
         return namespaces;
     }
 
@@ -235,17 +221,14 @@ public abstract class AdminResource extends PulsarWebResource {
 
     protected Policies getNamespacePolicies(String property, String cluster, String namespace) {
         try {
-            Policies policies = policiesCache().get(AdminResource.path("policies", property, cluster, namespace));
+            Policies policies = policiesCache().get(AdminResource.path("policies", property, cluster, namespace))
+                    .orElseThrow(() -> new RestException(Status.NOT_FOUND, "Namespace does not exist"));
             // fetch bundles from LocalZK-policies
             NamespaceBundles bundles = pulsar().getNamespaceService().getNamespaceBundleFactory()
                     .getBundles(new NamespaceName(property, cluster, namespace));
             BundlesData bundleData = NamespaceBundleFactory.getBundlesData(bundles);
             policies.bundles = bundleData != null ? bundleData : policies.bundles;
             return policies;
-        } catch (KeeperException.NoNodeException e) {
-            log.warn("[{}] Failed to get namespace policies {}/{}/{}: Does not exist", clientAppId(), property, cluster,
-                    namespace);
-            throw new RestException(Status.NOT_FOUND, "Namespace does not exist");
         } catch (RestException re) {
             throw re;
         } catch (Exception e) {
@@ -254,7 +237,7 @@ public abstract class AdminResource extends PulsarWebResource {
         }
     }
 
-    public ObjectMapper jsonMapper() {
+    public static ObjectMapper jsonMapper() {
         return ObjectMapperFactory.getThreadLocal();
     }
 

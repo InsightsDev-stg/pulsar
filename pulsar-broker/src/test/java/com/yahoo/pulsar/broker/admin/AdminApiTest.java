@@ -26,12 +26,12 @@ import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 import org.apache.bookkeeper.test.PortManager;
-import org.apache.zookeeper.KeeperException.NoNodeException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.testng.Assert;
@@ -120,7 +120,6 @@ public class AdminApiTest extends MockedPulsarServiceBaseTest {
         otherconfig.setBrokerServicePort(SECONDARY_BROKER_PORT);
         otherconfig.setWebServicePort(SECONDARY_BROKER_WEBSERVICE_PORT);
         otherconfig.setLoadBalancerEnabled(false);
-        otherconfig.setBindOnLocalhost(true);
         otherconfig.setClusterName("test");
 
         otherPulsar = startBroker(otherconfig);
@@ -312,7 +311,7 @@ public class AdminApiTest extends MockedPulsarServiceBaseTest {
                 admin.clusters().getNamespaceIsolationPolicies("usc");
                 fail("should have raised exception");
             } catch (PulsarAdminException e) {
-                assertTrue(e instanceof PreconditionFailedException);
+                assertTrue(e instanceof NotFoundException);
             }
 
             try {
@@ -353,7 +352,7 @@ public class AdminApiTest extends MockedPulsarServiceBaseTest {
         Assert.assertEquals(1, nsMap.size());
         for (String ns : nsMap.keySet()) {
             NamespaceOwnershipStatus nsStatus = nsMap.get(ns);
-            if (ns.equals(NamespaceService.getHeartbeatNamespace(pulsar.getHost(), pulsar.getConfiguration())
+            if (ns.equals(NamespaceService.getHeartbeatNamespace(pulsar.getAdvertisedAddress(), pulsar.getConfiguration())
                     + "/0x00000000_0xffffffff")) {
                 assertEquals(nsStatus.broker_assignment, BrokerAssignment.shared);
                 assertFalse(nsStatus.is_controlled);
@@ -459,14 +458,15 @@ public class AdminApiTest extends MockedPulsarServiceBaseTest {
         NamespaceBundle defaultBundle = bundleFactory.getFullBundle(ns);
         int i = 0;
         for (; i < 10; i++) {
-            try {
-                NamespaceEphemeralData data1 = pulsar.getNamespaceService().getOwnershipCache().getOwner(defaultBundle);
-                LOG.info("Waiting for unload namespace {} to complete. Current service unit isDisabled: {}",
-                        defaultBundle, data1.isDisabled());
-                Thread.sleep(1000);
-            } catch (NoNodeException nne) {
+            Optional<NamespaceEphemeralData> data1 = pulsar.getNamespaceService().getOwnershipCache()
+                    .getOwnerAsync(defaultBundle).get();
+            if (!data1.isPresent()) {
+                // Already unloaded
                 break;
             }
+            LOG.info("Waiting for unload namespace {} to complete. Current service unit isDisabled: {}", defaultBundle,
+                    data1.get().isDisabled());
+            Thread.sleep(1000);
         }
         assertTrue(i < 10);
 
@@ -1366,6 +1366,124 @@ public class AdminApiTest extends MockedPulsarServiceBaseTest {
         } catch (Exception e) {
             fail("Should not happen.");
         }
+    }
+
+    /**
+     * Verify: PersistentTopics.expireMessages()/expireMessagesForAllSubscriptions()
+     * 1. Created multiple shared subscriptions and publisher on topic
+     * 2. Publish messages on the topic
+     * 3. expire message on sub-1 : backlog for sub-1 must be 0
+     * 4. expire message on all subscriptions: backlog for all subscription must be 0
+     *
+     * @throws Exception
+     */
+    @Test
+    public void testPersistentTopicsExpireMessages() throws Exception{
+
+        // Force to create a destination
+        publishMessagesOnPersistentTopic("persistent://prop-xyz/use/ns1/ds2", 0);
+        assertEquals(admin.persistentTopics().getList("prop-xyz/use/ns1"),
+                Lists.newArrayList("persistent://prop-xyz/use/ns1/ds2"));
+
+        // create consumer and subscription
+        URL pulsarUrl = new URL("http://127.0.0.1" + ":" + BROKER_WEBSERVICE_PORT);
+        ClientConfiguration clientConf = new ClientConfiguration();
+        clientConf.setStatsInterval(0, TimeUnit.SECONDS);
+        PulsarClient client = PulsarClient.create(pulsarUrl.toString(), clientConf);
+        ConsumerConfiguration conf = new ConsumerConfiguration();
+        conf.setSubscriptionType(SubscriptionType.Shared);
+        Consumer consumer1 = client.subscribe("persistent://prop-xyz/use/ns1/ds2", "my-sub1", conf);
+        Consumer consumer2 = client.subscribe("persistent://prop-xyz/use/ns1/ds2", "my-sub2", conf);
+        Consumer consumer3 = client.subscribe("persistent://prop-xyz/use/ns1/ds2", "my-sub3", conf);
+
+        assertEquals(admin.persistentTopics().getSubscriptions("persistent://prop-xyz/use/ns1/ds2").size(), 3);
+
+        publishMessagesOnPersistentTopic("persistent://prop-xyz/use/ns1/ds2", 10);
+
+        PersistentTopicStats topicStats = admin.persistentTopics().getStats("persistent://prop-xyz/use/ns1/ds2");
+        assertEquals(topicStats.subscriptions.get("my-sub1").msgBacklog, 10);
+        assertEquals(topicStats.subscriptions.get("my-sub2").msgBacklog, 10);
+        assertEquals(topicStats.subscriptions.get("my-sub3").msgBacklog, 10);
+
+        Thread.sleep(1000); // wait for 1 seconds to expire message
+        admin.persistentTopics().expireMessages("persistent://prop-xyz/use/ns1/ds2", "my-sub1", 1);
+        Thread.sleep(1000); // wait for 1 seconds to execute expire message as it is async
+
+        topicStats = admin.persistentTopics().getStats("persistent://prop-xyz/use/ns1/ds2");
+        assertEquals(topicStats.subscriptions.get("my-sub1").msgBacklog, 0);
+        assertEquals(topicStats.subscriptions.get("my-sub2").msgBacklog, 10);
+        assertEquals(topicStats.subscriptions.get("my-sub3").msgBacklog, 10);
+
+        admin.persistentTopics().expireMessagesForAllSubscriptions("persistent://prop-xyz/use/ns1/ds2", 1);
+        Thread.sleep(1000); // wait for 1 seconds to execute expire message as it is async
+
+        topicStats = admin.persistentTopics().getStats("persistent://prop-xyz/use/ns1/ds2");
+        assertEquals(topicStats.subscriptions.get("my-sub1").msgBacklog, 0);
+        assertEquals(topicStats.subscriptions.get("my-sub2").msgBacklog, 0);
+        assertEquals(topicStats.subscriptions.get("my-sub3").msgBacklog, 0);
+
+        consumer1.close();
+        consumer2.close();
+        consumer3.close();
+
+    }
+
+    /**
+     * Verify: PersistentTopics.expireMessages()/expireMessagesForAllSubscriptions() for PartitionTopic
+     *
+     * @throws Exception
+     */
+    @Test
+    public void testPersistentTopicExpireMessageOnParitionTopic() throws Exception{
+
+        admin.persistentTopics().createPartitionedTopic("persistent://prop-xyz/use/ns1/ds1", 4);
+
+        // create consumer and subscription
+        URL pulsarUrl = new URL("http://127.0.0.1" + ":" + BROKER_WEBSERVICE_PORT);
+        ClientConfiguration clientConf = new ClientConfiguration();
+        clientConf.setStatsInterval(0, TimeUnit.SECONDS);
+        PulsarClient client = PulsarClient.create(pulsarUrl.toString(), clientConf);
+        ConsumerConfiguration conf = new ConsumerConfiguration();
+        conf.setSubscriptionType(SubscriptionType.Exclusive);
+        Consumer consumer = client.subscribe("persistent://prop-xyz/use/ns1/ds1", "my-sub", conf);
+
+        ProducerConfiguration prodConf = new ProducerConfiguration();
+        prodConf.setMessageRoutingMode(MessageRoutingMode.RoundRobinPartition);
+        Producer producer = client.createProducer("persistent://prop-xyz/use/ns1/ds1", prodConf);
+        for (int i = 0; i < 10; i++) {
+            String message = "message-" + i;
+            producer.send(message.getBytes());
+        }
+
+
+        PartitionedTopicStats topicStats = admin.persistentTopics()
+                .getPartitionedStats("persistent://prop-xyz/use/ns1/ds1", true);
+        assertEquals(topicStats.subscriptions.get("my-sub").msgBacklog, 10);
+
+        PersistentTopicStats partitionStatsPartition0 = topicStats.partitions
+                .get("persistent://prop-xyz/use/ns1/ds1-partition-0");
+        PersistentTopicStats partitionStatsPartition1 = topicStats.partitions
+                .get("persistent://prop-xyz/use/ns1/ds1-partition-1");
+        assertEquals(partitionStatsPartition0.subscriptions.get("my-sub").msgBacklog, 3, 1);
+        assertEquals(partitionStatsPartition1.subscriptions.get("my-sub").msgBacklog, 3, 1);
+
+        Thread.sleep(1000);
+        admin.persistentTopics().expireMessagesForAllSubscriptions("persistent://prop-xyz/use/ns1/ds1", 1);
+        Thread.sleep(1000);
+
+        topicStats = admin.persistentTopics()
+                .getPartitionedStats("persistent://prop-xyz/use/ns1/ds1", true);
+        partitionStatsPartition0 = topicStats.partitions
+                .get("persistent://prop-xyz/use/ns1/ds1-partition-0");
+        partitionStatsPartition1 = topicStats.partitions
+                .get("persistent://prop-xyz/use/ns1/ds1-partition-1");
+        assertEquals(partitionStatsPartition0.subscriptions.get("my-sub").msgBacklog, 0);
+        assertEquals(partitionStatsPartition1.subscriptions.get("my-sub").msgBacklog, 0);
+
+        producer.close();
+        consumer.close();
+        client.close();
+
     }
 
 }

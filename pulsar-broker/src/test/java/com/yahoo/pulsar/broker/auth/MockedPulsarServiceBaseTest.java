@@ -68,14 +68,16 @@ public abstract class MockedPulsarServiceBaseTest {
     protected MockZooKeeper mockZookKeeper;
     protected NonClosableMockBookKeeper mockBookKeeper;
 
+    private SameThreadOrderedSafeExecutor sameThreadOrderedSafeExecutor;
+
     public MockedPulsarServiceBaseTest() {
         this.conf = new ServiceConfiguration();
         this.conf.setBrokerServicePort(BROKER_PORT);
         this.conf.setBrokerServicePortTls(BROKER_PORT_TLS);
         this.conf.setWebServicePort(BROKER_WEBSERVICE_PORT);
         this.conf.setWebServicePortTls(BROKER_WEBSERVICE_PORT_TLS);
-        this.conf.setBindOnLocalhost(true);
         this.conf.setClusterName("test");
+        this.conf.setAdvertisedAddress("localhost"); // there are TLS tests in here, they need to use localhost because of the certificate
     }
 
     protected final void internalSetup() throws Exception {
@@ -96,10 +98,12 @@ public abstract class MockedPulsarServiceBaseTest {
         mockZookKeeper = createMockZooKeeper();
         mockBookKeeper = new NonClosableMockBookKeeper(new ClientConfiguration(), mockZookKeeper);
 
+        sameThreadOrderedSafeExecutor = new SameThreadOrderedSafeExecutor();
+
         startBroker();
 
-        brokerUrl = new URL("http://localhost:" + BROKER_WEBSERVICE_PORT);
-        brokerUrlTls = new URL("https://localhost:" + BROKER_WEBSERVICE_PORT_TLS);
+        brokerUrl = new URL("http://" + pulsar.getAdvertisedAddress() + ":" + BROKER_WEBSERVICE_PORT);
+        brokerUrlTls = new URL("https://" + pulsar.getAdvertisedAddress() + ":" + BROKER_WEBSERVICE_PORT_TLS);
 
         admin = spy(new PulsarAdmin(brokerUrl, (Authentication) null));
     }
@@ -110,6 +114,7 @@ public abstract class MockedPulsarServiceBaseTest {
         pulsar.close();
         mockBookKeeper.reallyShutdow();
         mockZookKeeper.shutdown();
+        sameThreadOrderedSafeExecutor.shutdown();
     }
 
     protected abstract void setup() throws Exception;
@@ -146,6 +151,8 @@ public abstract class MockedPulsarServiceBaseTest {
 
         Supplier<NamespaceService> namespaceServiceSupplier = () -> spy(new NamespaceService(pulsar));
         doReturn(namespaceServiceSupplier).when(pulsar).getNamespaceServiceProvider();
+
+        doReturn(sameThreadOrderedSafeExecutor).when(pulsar).getOrderedExecutor();
     }
 
     private MockZooKeeper createMockZooKeeper() throws Exception {

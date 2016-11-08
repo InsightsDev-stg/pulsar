@@ -21,6 +21,7 @@ import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
+import static org.testng.Assert.assertNotEquals;
 import static org.testng.Assert.assertTrue;
 import static org.testng.Assert.fail;
 
@@ -39,6 +40,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
 import org.apache.bookkeeper.mledger.impl.EntryCacheImpl;
 import org.apache.bookkeeper.mledger.impl.ManagedLedgerImpl;
@@ -54,6 +56,8 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 import com.yahoo.pulsar.broker.service.persistent.PersistentTopic;
 import com.yahoo.pulsar.client.impl.ConsumerImpl;
+import com.yahoo.pulsar.client.impl.MessageIdImpl;
+import com.yahoo.pulsar.client.util.FutureUtil;
 import com.yahoo.pulsar.common.api.PulsarDecoder;
 
 public class SimpleProducerConsumerTest extends ProducerConsumerBase {
@@ -564,12 +568,12 @@ public class SimpleProducerConsumerTest extends ProducerConsumerBase {
     /**
      * Usecase 1: Only 1 Active Subscription - 1 subscriber - Produce Messages - EntryCache should cache messages -
      * EntryCache should be cleaned : Once active subscription consumes messages
-     * 
+     *
      * Usecase 2: 2 Active Subscriptions (faster and slower) and slower gets closed - 2 subscribers - Produce Messages -
      * 1 faster-subscriber consumes all messages and another slower-subscriber none - EntryCache should have cached
      * messages as slower-subscriber has not consumed messages yet - close slower-subscriber - EntryCache should be
      * cleared
-     * 
+     *
      * @throws Exception
      */
     @Test
@@ -861,6 +865,74 @@ public class SimpleProducerConsumerTest extends ProducerConsumerBase {
         }
     }
 
+    /**
+     * consume message from consumer1 and send acknowledgement from different consumer subscribed under same
+     * subscription-name
+     *
+     * @throws Exception
+     */
+    @Test(timeOut = 30000)
+    public void testSharedConsumerAckDifferentConsumer() throws Exception {
+        log.info("-- Starting {} test --", methodName);
+
+        ConsumerConfiguration conf = new ConsumerConfiguration();
+        conf.setReceiverQueueSize(1);
+        conf.setSubscriptionType(SubscriptionType.Shared);
+        Consumer consumer1 = pulsarClient.subscribe("persistent://my-property/use/my-ns/my-topic1", "my-subscriber-name",
+                conf);
+        Consumer consumer2 = pulsarClient.subscribe("persistent://my-property/use/my-ns/my-topic1", "my-subscriber-name",
+                conf);
+
+        ProducerConfiguration producerConf = new ProducerConfiguration();
+
+        Producer producer = pulsarClient.createProducer("persistent://my-property/use/my-ns/my-topic1", producerConf);
+        for (int i = 0; i < 10; i++) {
+            String message = "my-message-" + i;
+            producer.send(message.getBytes());
+        }
+
+        Message msg = null;
+        Set<Message> consumerMsgSet1 = Sets.newHashSet();
+        Set<Message> consumerMsgSet2 = Sets.newHashSet();
+        for (int i = 0; i < 5; i++) {
+            msg = consumer1.receive();
+            consumerMsgSet1.add(msg);
+
+            msg = consumer2.receive();
+            consumerMsgSet2.add(msg);
+        }
+
+        consumerMsgSet1.stream().forEach(m -> {
+            try {
+                consumer2.acknowledge(m);
+            } catch (PulsarClientException e) {
+                fail();
+            }
+        });
+        consumerMsgSet2.stream().forEach(m -> {
+            try {
+                consumer1.acknowledge(m);
+            } catch (PulsarClientException e) {
+                fail();
+            }
+        });
+
+        consumer1.redeliverUnacknowledgedMessages();
+        consumer2.redeliverUnacknowledgedMessages();
+
+        try {
+            if (consumer1.receive(100, TimeUnit.MILLISECONDS) != null
+                    || consumer2.receive(100, TimeUnit.MILLISECONDS) != null) {
+                fail();
+            }
+        } finally {
+            consumer1.close();
+            consumer2.close();
+        }
+
+        log.info("-- Exiting {} test --", methodName);
+    }
+
     private void receiveAsync(Consumer consumer, int totalMessage, int currentMessage, CountDownLatch latch,
             final Set<String> consumeMsg, ExecutorService executor) throws PulsarClientException {
         if (currentMessage < totalMessage) {
@@ -888,4 +960,758 @@ public class SimpleProducerConsumerTest extends ProducerConsumerBase {
             });
         }
     }
+
+    /**
+     * Verify: Consumer stops receiving msg when reach unack-msg limit and
+     * starts receiving once acks messages
+     * 1. Produce X (600) messages
+     * 2. Consumer has receive size (10) and receive message without acknowledging
+     * 3. Consumer will stop receiving message after unAckThreshold = 500
+     * 4. Consumer acks messages and starts consuming remanining messages
+     * This testcase enables checksum sending while producing message and broker verifies the checksum for the message.
+     *
+     * @throws Exception
+     */
+    @Test
+    public void testConsumerBlockingWithUnAckedMessages() throws Exception {
+        log.info("-- Starting {} test --", methodName);
+
+        int unAckedMessages = pulsar.getConfiguration().getMaxUnackedMessagesPerConsumer();
+        try {
+            final int unAckedMessagesBufferSize = 500;
+            final int receiverQueueSize = 10;
+            final int totalProducedMsgs = 600;
+
+            pulsar.getConfiguration().setMaxUnackedMessagesPerConsumer(unAckedMessagesBufferSize);
+            ConsumerConfiguration conf = new ConsumerConfiguration();
+            conf.setReceiverQueueSize(receiverQueueSize);
+            conf.setSubscriptionType(SubscriptionType.Shared);
+            Consumer consumer = pulsarClient.subscribe("persistent://my-property/use/my-ns/unacked-topic",
+                    "subscriber-1", conf);
+
+            ProducerConfiguration producerConf = new ProducerConfiguration();
+
+            Producer producer = pulsarClient.createProducer("persistent://my-property/use/my-ns/unacked-topic",
+                    producerConf);
+
+            // (1) Produced Messages
+            for (int i = 0; i < totalProducedMsgs; i++) {
+                String message = "my-message-" + i;
+                producer.send(message.getBytes());
+            }
+
+            // (2) try to consume messages: but will be able to consume number of messages = unAckedMessagesBufferSize
+            Message msg = null;
+            List<Message> messages = Lists.newArrayList();
+            for (int i = 0; i < totalProducedMsgs; i++) {
+                msg = consumer.receive(1, TimeUnit.SECONDS);
+                if (msg != null) {
+                    messages.add(msg);
+                    log.info("Received message: " + new String(msg.getData()));
+                } else {
+                    break;
+                }
+            }
+            // client must receive number of messages = unAckedMessagesBufferSize rather all produced messages
+            assertEquals(messages.size(), unAckedMessagesBufferSize);
+
+            // start acknowledging messages
+            messages.forEach(m -> {
+                try {
+                    consumer.acknowledge(m);
+                } catch (PulsarClientException e) {
+                    fail("ack failed", e);
+                }
+            });
+
+            // try to consume remaining messages
+            int remainingMessages = totalProducedMsgs - messages.size();
+            for (int i = 0; i < remainingMessages; i++) {
+                msg = consumer.receive(1, TimeUnit.SECONDS);
+                if (msg != null) {
+                    messages.add(msg);
+                    log.info("Received message: " + new String(msg.getData()));
+                }
+            }
+
+            // total received-messages should match to produced messages
+            assertEquals(totalProducedMsgs, messages.size());
+            producer.close();
+            consumer.close();
+            log.info("-- Exiting {} test --", methodName);
+        } catch (Exception e) {
+            fail();
+        } finally {
+            pulsar.getConfiguration().setMaxUnackedMessagesPerConsumer(unAckedMessages);
+        }
+    }
+
+    /**
+     * Verify: iteration of
+     * a. message receive w/o acking
+     * b. stop receiving msg
+     * c. ack msgs
+     * d. started receiving msgs
+     *
+     * 1. Produce total X (1500) messages
+     * 2. Consumer consumes messages without acking until stop receiving
+     * from broker due to reaching ack-threshold (500)
+     * 3. Consumer acks messages after stop getting messages
+     * 4. Consumer again tries to consume messages
+     * 5. Consumer should be able to complete consuming all 1500 messages in 3 iteration (1500/500)
+     *
+     * @throws Exception
+     */
+    @Test
+    public void testConsumerBlockingWithUnAckedMessagesMultipleIteration() throws Exception {
+        log.info("-- Starting {} test --", methodName);
+
+        int unAckedMessages = pulsar.getConfiguration().getMaxUnackedMessagesPerConsumer();
+        try {
+            final int unAckedMessagesBufferSize = 500;
+            final int receiverQueueSize = 10;
+            final int totalProducedMsgs = 1500;
+
+            // receiver consumes messages in iteration after acknowledging broker
+            final int totalReceiveIteration = totalProducedMsgs / unAckedMessagesBufferSize;
+            pulsar.getConfiguration().setMaxUnackedMessagesPerConsumer(unAckedMessagesBufferSize);
+            ConsumerConfiguration conf = new ConsumerConfiguration();
+            conf.setReceiverQueueSize(receiverQueueSize);
+            conf.setSubscriptionType(SubscriptionType.Shared);
+            Consumer consumer = pulsarClient.subscribe("persistent://my-property/use/my-ns/unacked-topic",
+                    "subscriber-1", conf);
+
+            ProducerConfiguration producerConf = new ProducerConfiguration();
+
+            Producer producer = pulsarClient.createProducer("persistent://my-property/use/my-ns/unacked-topic",
+                    producerConf);
+
+            // (1) Produced Messages
+            for (int i = 0; i < totalProducedMsgs; i++) {
+                String message = "my-message-" + i;
+                producer.send(message.getBytes());
+            }
+
+            int totalReceivedMessages = 0;
+            // (2) Receive Messages
+            for (int j = 0; j < totalReceiveIteration; j++) {
+
+                Message msg = null;
+                List<Message> messages = Lists.newArrayList();
+                for (int i = 0; i < totalProducedMsgs; i++) {
+                    msg = consumer.receive(1, TimeUnit.SECONDS);
+                    if (msg != null) {
+                        messages.add(msg);
+                        log.info("Received message: " + new String(msg.getData()));
+                    } else {
+                        break;
+                    }
+                }
+                // client must receive number of messages = unAckedMessagesBufferSize rather all produced messages
+                assertEquals(messages.size(), unAckedMessagesBufferSize);
+
+                // start acknowledging messages
+                messages.forEach(m -> {
+                    try {
+                        consumer.acknowledge(m);
+                    } catch (PulsarClientException e) {
+                        fail("ack failed", e);
+                    }
+                });
+                totalReceivedMessages += messages.size();
+            }
+
+            // total received-messages should match to produced messages
+            assertEquals(totalReceivedMessages, totalProducedMsgs);
+            producer.close();
+            consumer.close();
+            log.info("-- Exiting {} test --", methodName);
+        } catch (Exception e) {
+            fail();
+        } finally {
+            pulsar.getConfiguration().setMaxUnackedMessagesPerConsumer(unAckedMessages);
+        }
+    }
+
+
+    /**
+     * Verify: Consumer1 which doesn't send ack will not impact Consumer2 which sends ack for consumed message.
+     *
+     *
+     * @param batchMessageDelayMs
+     * @throws Exception
+     */
+    @Test
+    public void testMutlipleSharedConsumerBlockingWithUnAckedMessages() throws Exception {
+        log.info("-- Starting {} test --", methodName);
+
+        int unAckedMessages = pulsar.getConfiguration().getMaxUnackedMessagesPerConsumer();
+        try {
+            final int maxUnackedMessages = 20;
+            final int receiverQueueSize = 10;
+            final int totalProducedMsgs = 100;
+            int totalReceiveMessages = 0;
+
+            pulsar.getConfiguration().setMaxUnackedMessagesPerConsumer(maxUnackedMessages);
+            ConsumerConfiguration conf = new ConsumerConfiguration();
+            conf.setReceiverQueueSize(receiverQueueSize);
+            conf.setSubscriptionType(SubscriptionType.Shared);
+            Consumer consumer1 = pulsarClient.subscribe("persistent://my-property/use/my-ns/unacked-topic",
+                    "subscriber-1", conf);
+            Consumer consumer2 = pulsarClient.subscribe("persistent://my-property/use/my-ns/unacked-topic",
+                    "subscriber-1", conf);
+
+            ProducerConfiguration producerConf = new ProducerConfiguration();
+
+            Producer producer = pulsarClient.createProducer("persistent://my-property/use/my-ns/unacked-topic",
+                    producerConf);
+
+            // (1) Produced Messages
+            for (int i = 0; i < totalProducedMsgs; i++) {
+                String message = "my-message-" + i;
+                producer.send(message.getBytes());
+            }
+
+
+            // (2) Consumer1: consume without ack:
+            // try to consume messages: but will be able to consume number of messages = maxUnackedMessages
+            Message msg = null;
+            List<Message> messages = Lists.newArrayList();
+            for (int i = 0; i < totalProducedMsgs; i++) {
+                msg = consumer1.receive(1, TimeUnit.SECONDS);
+                if (msg != null) {
+                    messages.add(msg);
+                    totalReceiveMessages++;
+                    log.info("Received message: " + new String(msg.getData()));
+                } else {
+                    break;
+                }
+            }
+            // client must receive number of messages = unAckedMessagesBufferSize rather all produced messages
+            assertEquals(messages.size(), maxUnackedMessages);
+
+            // (3.1) Consumer2 will start consuming messages without ack: it should stop after maxUnackedMessages
+            messages.clear();
+            for (int i = 0; i < totalProducedMsgs - maxUnackedMessages; i++) {
+                msg = consumer2.receive(1, TimeUnit.SECONDS);
+                if (msg != null) {
+                    messages.add(msg);
+                    totalReceiveMessages++;
+                    log.info("Received message: " + new String(msg.getData()));
+                } else {
+                    break;
+                }
+            }
+            assertEquals(messages.size(), maxUnackedMessages);
+            // (3.2) ack for all maxUnackedMessages
+            messages.forEach(m -> {
+                try {
+                    consumer2.acknowledge(m);
+                } catch (PulsarClientException e) {
+                    fail("shouldn't have failed ", e);
+                }
+            });
+
+            // (4) Consumer2 consumer and ack: so it should consume all remaining messages
+            messages.clear();
+            for (int i = 0; i < totalProducedMsgs - (2 * maxUnackedMessages); i++) {
+                msg = consumer2.receive(1, TimeUnit.SECONDS);
+                if (msg != null) {
+                    messages.add(msg);
+                    totalReceiveMessages++;
+                    consumer2.acknowledge(msg);
+                    log.info("Received message: " + new String(msg.getData()));
+                } else {
+                    break;
+                }
+            }
+
+            // verify total-consumer messages = total-produce messages
+            assertEquals(totalProducedMsgs, totalReceiveMessages);
+            producer.close();
+            consumer1.close();
+            consumer2.close();
+            log.info("-- Exiting {} test --", methodName);
+        } catch (Exception e) {
+            fail();
+        } finally {
+            pulsar.getConfiguration().setMaxUnackedMessagesPerConsumer(unAckedMessages);
+        }
+    }
+
+    @Test
+    public void testUnackBlockRedeliverMessages() throws Exception {
+        log.info("-- Starting {} test --", methodName);
+
+        int unAckedMessages = pulsar.getConfiguration().getMaxUnackedMessagesPerConsumer();
+        int totalReceiveMsg = 0;
+        try {
+            final int unAckedMessagesBufferSize = 10;
+            final int receiverQueueSize = 20;
+            final int totalProducedMsgs = 100;
+
+            pulsar.getConfiguration().setMaxUnackedMessagesPerConsumer(unAckedMessagesBufferSize);
+            ConsumerConfiguration conf = new ConsumerConfiguration();
+            conf.setReceiverQueueSize(receiverQueueSize);
+            conf.setSubscriptionType(SubscriptionType.Shared);
+            ConsumerImpl consumer = (ConsumerImpl) pulsarClient
+                    .subscribe("persistent://my-property/use/my-ns/unacked-topic", "subscriber-1", conf);
+
+            ProducerConfiguration producerConf = new ProducerConfiguration();
+
+            Producer producer = pulsarClient.createProducer("persistent://my-property/use/my-ns/unacked-topic",
+                    producerConf);
+
+            // (1) Produced Messages
+            for (int i = 0; i < totalProducedMsgs; i++) {
+                String message = "my-message-" + i;
+                producer.send(message.getBytes());
+            }
+
+            // (2) try to consume messages: but will be able to consume number of messages = unAckedMessagesBufferSize
+            Message msg = null;
+            List<Message> messages = Lists.newArrayList();
+            for (int i = 0; i < totalProducedMsgs; i++) {
+                msg = consumer.receive(1, TimeUnit.SECONDS);
+                if (msg != null) {
+                    messages.add(msg);
+                    totalReceiveMsg++;
+                    log.info("Received message: " + new String(msg.getData()));
+                } else {
+                    break;
+                }
+            }
+
+            consumer.redeliverUnacknowledgedMessages();
+
+            Thread.sleep(1000);
+            int alreadyConsumedMessages = messages.size();
+            messages.clear();
+            for (int i = 0; i < totalProducedMsgs; i++) {
+                msg = consumer.receive(1, TimeUnit.SECONDS);
+                if (msg != null) {
+                    consumer.acknowledge(msg);
+                    totalReceiveMsg++;
+                    log.info("Received message: " + new String(msg.getData()));
+                } else {
+                    break;
+                }
+            }
+
+            // total received-messages should match to produced messages
+            assertEquals(totalProducedMsgs + alreadyConsumedMessages, totalReceiveMsg);
+            producer.close();
+            consumer.close();
+            log.info("-- Exiting {} test --", methodName);
+        } catch (Exception e) {
+            fail();
+        } finally {
+            pulsar.getConfiguration().setMaxUnackedMessagesPerConsumer(unAckedMessages);
+        }
+    }
+
+    @Test(dataProvider = "batch")
+    public void testUnackedBlockAtBatch(int batchMessageDelayMs) throws Exception {
+        log.info("-- Starting {} test --", methodName);
+
+        int unAckedMessages = pulsar.getConfiguration().getMaxUnackedMessagesPerConsumer();
+        try {
+            final int maxUnackedMessages = 20;
+            final int receiverQueueSize = 10;
+            final int totalProducedMsgs = 100;
+            int totalReceiveMessages = 0;
+
+            pulsar.getConfiguration().setMaxUnackedMessagesPerConsumer(maxUnackedMessages);
+            ConsumerConfiguration conf = new ConsumerConfiguration();
+            conf.setReceiverQueueSize(receiverQueueSize);
+            conf.setSubscriptionType(SubscriptionType.Shared);
+            Consumer consumer1 = pulsarClient.subscribe("persistent://my-property/use/my-ns/unacked-topic",
+                    "subscriber-1", conf);
+
+            ProducerConfiguration producerConf = new ProducerConfiguration();
+
+            if (batchMessageDelayMs != 0) {
+                producerConf.setBatchingEnabled(true);
+                producerConf.setBatchingMaxPublishDelay(batchMessageDelayMs, TimeUnit.MILLISECONDS);
+                producerConf.setBatchingMaxMessages(5);
+            }
+
+            Producer producer = pulsarClient.createProducer("persistent://my-property/use/my-ns/unacked-topic",
+                    producerConf);
+
+            List<CompletableFuture<MessageId>> futures = Lists.newArrayList();
+            // (1) Produced Messages
+            for (int i = 0; i < totalProducedMsgs; i++) {
+                String message = "my-message-" + i;
+                futures.add(producer.sendAsync(message.getBytes()));
+            }
+
+            FutureUtil.waitForAll(futures).get();
+
+            // (2) Consumer1: consume without ack:
+            // try to consume messages: but will be able to consume number of messages = maxUnackedMessages
+            Message msg = null;
+            List<Message> messages = Lists.newArrayList();
+            for (int i = 0; i < totalProducedMsgs; i++) {
+                msg = consumer1.receive(1, TimeUnit.SECONDS);
+                if (msg != null) {
+                    messages.add(msg);
+                    totalReceiveMessages++;
+                    log.info("Received message: " + new String(msg.getData()));
+                } else {
+                    break;
+                }
+            }
+            // should be blocked due to unack-msgs and should not consume all msgs
+            assertNotEquals(messages.size(), totalProducedMsgs);
+            // ack for all maxUnackedMessages
+            messages.forEach(m -> {
+                try {
+                    consumer1.acknowledge(m);
+                } catch (PulsarClientException e) {
+                    fail("shouldn't have failed ", e);
+                }
+            });
+
+            // (3) Consumer consumes and ack: so it should consume all remaining messages
+            messages.clear();
+            for (int i = 0; i < totalProducedMsgs; i++) {
+                msg = consumer1.receive(1, TimeUnit.SECONDS);
+                if (msg != null) {
+                    messages.add(msg);
+                    totalReceiveMessages++;
+                    consumer1.acknowledge(msg);
+                    log.info("Received message: " + new String(msg.getData()));
+                } else {
+                    break;
+                }
+            }
+            // verify total-consumer messages = total-produce messages
+            assertEquals(totalProducedMsgs, totalReceiveMessages);
+            producer.close();
+            consumer1.close();
+            log.info("-- Exiting {} test --", methodName);
+        } catch (Exception e) {
+            fail();
+        } finally {
+            pulsar.getConfiguration().setMaxUnackedMessagesPerConsumer(unAckedMessages);
+        }
+    }
+
+    /**
+     * Verify: Consumer2 sends ack of Consumer1 and consumer1 should be unblock if it is blocked due to unack-messages
+     *
+     *
+     * @param batchMessageDelayMs
+     * @throws Exception
+     */
+    @Test
+    public void testBlockUnackConsumerAckByDifferentConsumer() throws Exception {
+        log.info("-- Starting {} test --", methodName);
+
+        int unAckedMessages = pulsar.getConfiguration().getMaxUnackedMessagesPerConsumer();
+        try {
+            final int maxUnackedMessages = 20;
+            final int receiverQueueSize = 10;
+            final int totalProducedMsgs = 100;
+            int totalReceiveMessages = 0;
+
+            pulsar.getConfiguration().setMaxUnackedMessagesPerConsumer(maxUnackedMessages);
+            ConsumerConfiguration conf = new ConsumerConfiguration();
+            conf.setReceiverQueueSize(receiverQueueSize);
+            conf.setSubscriptionType(SubscriptionType.Shared);
+            Consumer consumer1 = pulsarClient.subscribe("persistent://my-property/use/my-ns/unacked-topic",
+                    "subscriber-1", conf);
+            Consumer consumer2 = pulsarClient.subscribe("persistent://my-property/use/my-ns/unacked-topic",
+                    "subscriber-1", conf);
+
+            ProducerConfiguration producerConf = new ProducerConfiguration();
+
+            Producer producer = pulsarClient.createProducer("persistent://my-property/use/my-ns/unacked-topic",
+                    producerConf);
+
+            // (1) Produced Messages
+            for (int i = 0; i < totalProducedMsgs; i++) {
+                String message = "my-message-" + i;
+                producer.send(message.getBytes());
+            }
+
+
+            // (2) Consumer1: consume without ack:
+            // try to consume messages: but will be able to consume number of messages = maxUnackedMessages
+            Message msg = null;
+            List<Message> messages = Lists.newArrayList();
+            for (int i = 0; i < totalProducedMsgs; i++) {
+                msg = consumer1.receive(1, TimeUnit.SECONDS);
+                if (msg != null) {
+                    messages.add(msg);
+                    totalReceiveMessages++;
+                    log.info("Received message: " + new String(msg.getData()));
+                } else {
+                    break;
+                }
+            }
+
+            assertEquals(messages.size(), maxUnackedMessages); //consumer1
+
+            // (3) ack for all UnackedMessages from consumer2
+            messages.forEach(m -> {
+                try {
+                    consumer2.acknowledge(m);
+                } catch (PulsarClientException e) {
+                    fail("shouldn't have failed ", e);
+                }
+            });
+
+            // (4) consumer1 will consumer remaining msgs and consumer2 will ack those messages
+            for (int i = 0; i < totalProducedMsgs; i++) {
+                msg = consumer1.receive(1, TimeUnit.SECONDS);
+                if (msg != null) {
+                    totalReceiveMessages++;
+                    consumer2.acknowledge(msg);
+                    log.info("Received message: " + new String(msg.getData()));
+                } else {
+                    break;
+                }
+            }
+
+            for (int i = 0; i < totalProducedMsgs; i++) {
+                msg = consumer2.receive(1, TimeUnit.SECONDS);
+                if (msg != null) {
+                    totalReceiveMessages++;
+                    log.info("Received message: " + new String(msg.getData()));
+                } else {
+                    break;
+                }
+            }
+
+            // verify total-consumer messages = total-produce messages
+            assertEquals(totalProducedMsgs, totalReceiveMessages);
+            producer.close();
+            consumer1.close();
+            consumer2.close();
+            log.info("-- Exiting {} test --", methodName);
+        } catch (Exception e) {
+            fail();
+        } finally {
+            pulsar.getConfiguration().setMaxUnackedMessagesPerConsumer(unAckedMessages);
+        }
+    }
+
+    @Test
+    public void testEnabledChecksumClient() throws Exception {
+        log.info("-- Starting {} test --", methodName);
+
+        final int totalMsg = 10;
+        ConsumerConfiguration conf = new ConsumerConfiguration();
+        conf.setSubscriptionType(SubscriptionType.Exclusive);
+        Consumer consumer = pulsarClient.subscribe("persistent://my-property/use/my-ns/my-topic1", "my-subscriber-name",
+                conf);
+
+        ProducerConfiguration producerConf = new ProducerConfiguration();
+        final int batchMessageDelayMs = 300;
+        if (batchMessageDelayMs != 0) {
+            producerConf.setBatchingEnabled(true);
+            producerConf.setBatchingMaxPublishDelay(batchMessageDelayMs, TimeUnit.MILLISECONDS);
+            producerConf.setBatchingMaxMessages(5);
+        }
+
+        Producer producer = pulsarClient.createProducer("persistent://my-property/use/my-ns/my-topic1", producerConf);
+        for (int i = 0; i < totalMsg; i++) {
+            String message = "my-message-" + i;
+            producer.send(message.getBytes());
+        }
+
+        Message msg = null;
+        Set<String> messageSet = Sets.newHashSet();
+        for (int i = 0; i < totalMsg; i++) {
+            msg = consumer.receive(5, TimeUnit.SECONDS);
+            String receivedMessage = new String(msg.getData());
+            log.debug("Received message: [{}]", receivedMessage);
+            String expectedMessage = "my-message-" + i;
+            testMessageOrderAndDuplicates(messageSet, receivedMessage, expectedMessage);
+        }
+        // Acknowledge the consumption of all messages at once
+        consumer.acknowledgeCumulative(msg);
+        consumer.close();
+        log.info("-- Exiting {} test --", methodName);
+    }
+
+    /**
+     * It verifies that redelivery-of-specific messages: that redelivers all those messages even when consumer gets
+     * blocked due to unacked messsages
+     *
+     * Usecase: produce message with 10ms interval: so, consumer can consume only 10 messages without acking
+     *
+     * @throws Exception
+     */
+    @Test
+    public void testBlockUnackedConsumerRedeliverySpecificMessagesProduceWithPause() throws Exception {
+        log.info("-- Starting {} test --", methodName);
+
+        int unAckedMessages = pulsar.getConfiguration().getMaxUnackedMessagesPerConsumer();
+        try {
+            final int unAckedMessagesBufferSize = 10;
+            final int receiverQueueSize = 20;
+            final int totalProducedMsgs = 20;
+
+            pulsar.getConfiguration().setMaxUnackedMessagesPerConsumer(unAckedMessagesBufferSize);
+            ConsumerConfiguration conf = new ConsumerConfiguration();
+            conf.setReceiverQueueSize(receiverQueueSize);
+            conf.setSubscriptionType(SubscriptionType.Shared);
+            ConsumerImpl consumer = (ConsumerImpl) pulsarClient
+                    .subscribe("persistent://my-property/use/my-ns/unacked-topic", "subscriber-1", conf);
+
+            ProducerConfiguration producerConf = new ProducerConfiguration();
+
+            Producer producer = pulsarClient.createProducer("persistent://my-property/use/my-ns/unacked-topic",
+                    producerConf);
+
+            // (1) Produced Messages
+            for (int i = 0; i < totalProducedMsgs; i++) {
+                String message = "my-message-" + i;
+                producer.send(message.getBytes());
+                Thread.sleep(10);
+            }
+
+            // (2) try to consume messages: but will be able to consume number of messages = unAckedMessagesBufferSize
+            Message msg = null;
+            List<Message> messages1 = Lists.newArrayList();
+            for (int i = 0; i < totalProducedMsgs; i++) {
+                msg = consumer.receive(1, TimeUnit.SECONDS);
+                if (msg != null) {
+                    messages1.add(msg);
+                    log.info("Received message: " + new String(msg.getData()));
+                } else {
+                    break;
+                }
+            }
+
+            // client should not receive all produced messages and should be blocked due to unack-messages
+            assertEquals(messages1.size(), unAckedMessagesBufferSize);
+            Set<MessageIdImpl> redeliveryMessages = messages1.stream().map(m -> {
+                return (MessageIdImpl) m.getMessageId();
+            }).collect(Collectors.toSet());
+
+            // (3) redeliver all consumed messages
+            consumer.redeliverUnacknowledgedMessages(Lists.newArrayList(redeliveryMessages));
+            Thread.sleep(1000);
+
+            Set<MessageIdImpl> messages2 = Sets.newHashSet();
+            for (int i = 0; i < totalProducedMsgs; i++) {
+                msg = consumer.receive(1, TimeUnit.SECONDS);
+                if (msg != null) {
+                    messages2.add((MessageIdImpl) msg.getMessageId());
+                    log.info("Received message: " + new String(msg.getData()));
+                } else {
+                    break;
+                }
+            }
+
+            assertEquals(messages1.size(), messages2.size());
+            // (4) Verify: redelivered all previous unacked-consumed messages
+            messages2.removeAll(redeliveryMessages);
+            assertEquals(messages2.size(), 0);
+            producer.close();
+            consumer.close();
+            log.info("-- Exiting {} test --", methodName);
+        } catch (Exception e) {
+            fail();
+        } finally {
+            pulsar.getConfiguration().setMaxUnackedMessagesPerConsumer(unAckedMessages);
+        }
+    }
+
+    /**
+     * It verifies that redelivery-of-specific messages: that redelivers all those messages even when consumer gets
+     * blocked due to unacked messsages
+     *
+     * Usecase: Consumer starts consuming only after all messages have been produced.
+     * So, consumer consumes total receiver-queue-size number messages => ask for redelivery and receives all messages again.
+     *
+     * @throws Exception
+     */
+    @Test(invocationCount=10)
+    public void testBlockUnackedConsumerRedeliverySpecificMessagesCloseConsumerWhileProduce() throws Exception {
+        log.info("-- Starting {} test --", methodName);
+
+        int unAckedMessages = pulsar.getConfiguration().getMaxUnackedMessagesPerConsumer();
+        try {
+            final int unAckedMessagesBufferSize = 10;
+            final int receiverQueueSize = 20;
+            final int totalProducedMsgs = 50;
+
+            pulsar.getConfiguration().setMaxUnackedMessagesPerConsumer(unAckedMessagesBufferSize);
+            ConsumerConfiguration conf = new ConsumerConfiguration();
+            conf.setReceiverQueueSize(receiverQueueSize);
+            conf.setSubscriptionType(SubscriptionType.Shared);
+            // Only subscribe consumer
+            ConsumerImpl consumer = (ConsumerImpl) pulsarClient
+                    .subscribe("persistent://my-property/use/my-ns/unacked-topic", "subscriber-1", conf);
+            consumer.close();
+
+            ProducerConfiguration producerConf = new ProducerConfiguration();
+
+            Producer producer = pulsarClient.createProducer("persistent://my-property/use/my-ns/unacked-topic",
+                    producerConf);
+
+            // (1) Produced Messages
+            for (int i = 0; i < totalProducedMsgs; i++) {
+                String message = "my-message-" + i;
+                producer.send(message.getBytes());
+                Thread.sleep(10);
+            }
+
+            // (1.a) start consumer again
+            consumer = (ConsumerImpl) pulsarClient.subscribe("persistent://my-property/use/my-ns/unacked-topic",
+                    "subscriber-1", conf);
+
+            // (2) try to consume messages: but will be able to consume number of messages = unAckedMessagesBufferSize
+            Message msg = null;
+            List<Message> messages1 = Lists.newArrayList();
+            for (int i = 0; i < totalProducedMsgs; i++) {
+                msg = consumer.receive(1, TimeUnit.SECONDS);
+                if (msg != null) {
+                    messages1.add(msg);
+                    log.info("Received message: " + new String(msg.getData()));
+                } else {
+                    break;
+                }
+            }
+
+            // client should not receive all produced messages and should be blocked due to unack-messages
+            assertEquals(messages1.size(), receiverQueueSize);
+            Set<MessageIdImpl> redeliveryMessages = messages1.stream().map(m -> {
+                return (MessageIdImpl) m.getMessageId();
+            }).collect(Collectors.toSet());
+
+            // (3) redeliver all consumed messages
+            consumer.redeliverUnacknowledgedMessages(Lists.newArrayList(redeliveryMessages));
+            Thread.sleep(1000);
+
+            Set<MessageIdImpl> messages2 = Sets.newHashSet();
+            for (int i = 0; i < totalProducedMsgs; i++) {
+                msg = consumer.receive(1, TimeUnit.SECONDS);
+                if (msg != null) {
+                    messages2.add((MessageIdImpl) msg.getMessageId());
+                    log.info("Received message: " + new String(msg.getData()));
+                } else {
+                    break;
+                }
+            }
+
+            assertEquals(messages1.size(), messages2.size());
+            // (4) Verify: redelivered all previous unacked-consumed messages
+            messages2.removeAll(redeliveryMessages);
+            assertEquals(messages2.size(), 0);
+            producer.close();
+            consumer.close();
+            log.info("-- Exiting {} test --", methodName);
+        } catch (Exception e) {
+            fail();
+        } finally {
+            pulsar.getConfiguration().setMaxUnackedMessagesPerConsumer(unAckedMessages);
+        }
+    }
+
 }

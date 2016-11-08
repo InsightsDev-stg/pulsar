@@ -25,6 +25,7 @@ import static org.testng.Assert.fail;
 import java.lang.reflect.Field;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeSet;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -38,13 +39,15 @@ import org.apache.bookkeeper.mledger.ManagedCursor;
 import org.apache.bookkeeper.mledger.impl.EntryCacheImpl;
 import org.apache.bookkeeper.mledger.impl.ManagedLedgerFactoryImpl;
 import org.apache.bookkeeper.mledger.impl.ManagedLedgerImpl;
+import org.apache.bookkeeper.mledger.impl.PositionImpl;
 import org.testng.Assert;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
 
-import com.yahoo.pulsar.broker.loadbalance.data.NamespaceBundleStats;
+import com.google.common.collect.Sets;
+import com.yahoo.pulsar.broker.service.persistent.PersistentDispatcherMultipleConsumers;
 import com.yahoo.pulsar.broker.service.persistent.PersistentSubscription;
 import com.yahoo.pulsar.broker.service.persistent.PersistentTopic;
 import com.yahoo.pulsar.broker.stats.Metrics;
@@ -65,6 +68,7 @@ import com.yahoo.pulsar.client.impl.MessageIdImpl;
 import com.yahoo.pulsar.client.impl.ProducerImpl;
 import com.yahoo.pulsar.common.api.proto.PulsarApi.CommandSubscribe.SubType;
 import com.yahoo.pulsar.common.naming.DestinationName;
+import com.yahoo.pulsar.common.policies.data.loadbalancer.NamespaceBundleStats;
 
 /**
  */
@@ -1024,8 +1028,7 @@ public class PersistentTopicE2ETest extends BrokerTestBase {
         assertTrue(msgInRate > 0);
     }
 
-    // TODO: Re-enable once header+payload checksum changes are merged
-    @Test(enabled = false)
+    @Test
     public void testPayloadCorruptionDetection() throws Exception {
         final String topicName = "persistent://prop/use/ns-abc/topic1";
 
@@ -1062,11 +1065,149 @@ public class PersistentTopicE2ETest extends BrokerTestBase {
         }
 
         // We should only receive msg1
-        Message msg = consumer.receive(10, TimeUnit.SECONDS);
+        Message msg = consumer.receive(1, TimeUnit.SECONDS);
         assertEquals(new String(msg.getData()), "message-1");
 
-        while ((msg = consumer.receive(5, TimeUnit.SECONDS)) != null) {
+        while ((msg = consumer.receive(1, TimeUnit.SECONDS)) != null) {
             assertEquals(new String(msg.getData()), "message-1");
         }
     }
+
+    /**
+     * Verify: Broker should not replay already acknowledged messages again and should clear them from messageReplay bucket
+     *
+     * 1. produce messages
+     * 2. consume messages and ack all except 1 msg
+     * 3. Verification: should replay only 1 unacked message
+     */
+    @Test()
+    public void testMessageRedelivery() throws Exception {
+        final String topicName = "persistent://prop/use/ns-abc/topic2";
+        final String subName = "sub2";
+
+        Message msg;
+        int totalMessages = 10;
+
+        ConsumerConfiguration conf = new ConsumerConfiguration();
+        conf.setSubscriptionType(SubscriptionType.Shared);
+
+        Consumer consumer = pulsarClient.subscribe(topicName, subName, conf);
+        Producer producer = pulsarClient.createProducer(topicName);
+
+        // (1) Produce messages
+        for (int i = 0; i < totalMessages; i++) {
+            String message = "my-message-" + i;
+            producer.send(message.getBytes());
+        }
+
+        //(2) Consume and ack messages except first message
+        Message unAckedMsg = null;
+        for (int i = 0; i < totalMessages; i++) {
+            msg = consumer.receive();
+            if (i == 0) {
+                unAckedMsg = msg;
+            } else {
+                consumer.acknowledge(msg);
+            }
+        }
+
+        consumer.redeliverUnacknowledgedMessages();
+
+        // Verify: msg [L:0] must be redelivered
+        try {
+            msg = consumer.receive(1, TimeUnit.SECONDS);
+            assertEquals(new String(msg.getData()), new String(unAckedMsg.getData()));
+        } catch (Exception e) {
+            fail("msg should be redelivered ", e);
+        }
+
+        // Verify no other messages are redelivered
+        msg = consumer.receive(100, TimeUnit.MILLISECONDS);
+        assertNull(msg);
+
+        consumer.close();
+        producer.close();
+    }
+
+    /**
+     * Verify: 
+     * 1. Broker should not replay already acknowledged messages 
+     * 2. Dispatcher should not stuck while dispatching new messages due to previous-replay 
+     * of invalid/already-acked messages
+     * 
+     * @throws Exception
+     */
+    @Test
+    public void testMessageReplay() throws Exception {
+
+        final String topicName = "persistent://prop/use/ns-abc/topic2";
+        final String subName = "sub2";
+
+        Message msg;
+        int totalMessages = 10;
+        int replayIndex = totalMessages / 2;
+
+        ConsumerConfiguration conf = new ConsumerConfiguration();
+        conf.setSubscriptionType(SubscriptionType.Shared);
+        conf.setReceiverQueueSize(1);
+
+        Consumer consumer = pulsarClient.subscribe(topicName, subName, conf);
+        Producer producer = pulsarClient.createProducer(topicName);
+
+        PersistentTopic topicRef = (PersistentTopic) pulsar.getBrokerService().getTopicReference(topicName);
+        assertNotNull(topicRef);
+        PersistentSubscription subRef = topicRef.getPersistentSubscription(subName);
+        PersistentDispatcherMultipleConsumers dispatcher = (PersistentDispatcherMultipleConsumers) subRef
+                .getDispatcher();
+        Field replayMap = PersistentDispatcherMultipleConsumers.class.getDeclaredField("messagesToReplay");
+        replayMap.setAccessible(true);
+        TreeSet<PositionImpl> messagesToReplay = Sets.newTreeSet();
+
+        assertNotNull(subRef);
+
+        // (1) Produce messages
+        for (int i = 0; i < totalMessages; i++) {
+            String message = "my-message-" + i;
+            producer.send(message.getBytes());
+        }
+
+        MessageIdImpl firstAckedMsg = null;
+        // (2) Consume and ack messages except first message
+        for (int i = 0; i < totalMessages; i++) {
+            msg = consumer.receive();
+            consumer.acknowledge(msg);
+            MessageIdImpl msgId = (MessageIdImpl) msg.getMessageId();
+            if (i == 0) {
+                firstAckedMsg = msgId;
+            }
+            if (i < replayIndex) {
+                // (3) accumulate acked messages for replay
+                messagesToReplay.add(new PositionImpl(msgId.getLedgerId(), msgId.getEntryId()));
+            }
+        }
+
+        // (4) redelivery : should redeliver only unacked messages
+        Thread.sleep(1000);
+
+        replayMap.set(dispatcher, messagesToReplay);
+        // (a) redelivery with all acked-message should clear messageReply bucket
+        dispatcher.redeliverUnacknowledgedMessages(dispatcher.getConsumers().get(0));
+        assertEquals(messagesToReplay.size(), 0);
+
+        // (b) fill messageReplyBucket with already acked entry again: and try to publish new msg and read it
+        messagesToReplay.add(new PositionImpl(firstAckedMsg.getLedgerId(), firstAckedMsg.getEntryId()));
+        replayMap.set(dispatcher, messagesToReplay);
+        // send new message
+        final String testMsg = "testMsg";
+        producer.send(testMsg.getBytes());
+        // consumer should be able to receive only new message and not the
+        dispatcher.consumerFlow(dispatcher.getConsumers().get(0), 1);
+        msg = consumer.receive(1, TimeUnit.SECONDS);
+        assertNotNull(msg);
+        assertEquals(msg.getData(), testMsg.getBytes());
+
+        consumer.close();
+        producer.close();
+    }
+    
 }

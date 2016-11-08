@@ -21,7 +21,7 @@
 	<parent>
 		<groupId>com.yahoo.pulsar</groupId>
 		<artifactId>pulsar</artifactId>
-		<version>1.15-SNAPSHOT</version>
+		<version>1.16-SNAPSHOT</version>
 		<relativePath>..</relativePath>
 	</parent>
 
@@ -61,7 +61,7 @@
 			<version>${project.version}</version>
 		</dependency>
 		<dependency>
-			<groupId>com.ning</groupId>
+			<groupId>org.asynchttpclient</groupId>
 			<artifactId>async-http-client</artifactId>
 		</dependency>
 		<dependency>
